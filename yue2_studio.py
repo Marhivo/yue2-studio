@@ -59,7 +59,7 @@ except Exception:  # pragma: no cover
     HAS_MULTIMEDIA = False
 
 APP_NAME = "YuE2 Studio"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 IS_WINDOWS = sys.platform == "win32"
 NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 
@@ -638,6 +638,7 @@ class GenWorker(QThread):
     midi_done = Signal(str)
     task_failed = Signal(str, str)
     asr_done = Signal(str, str)
+    asr_timed = Signal(list, str, float)
     remake_abc = Signal(str)
     idle = Signal()
 
@@ -869,6 +870,10 @@ class GenWorker(QThread):
         peak = float(np.abs(mono).max()) if mono.size else 0.0
         if peak > 1e-4:
             mono = mono * (0.9 / peak)
+        if job.get("timed"):
+            if self._do_asr_timed(job, api, cfg, mono[0]):
+                return
+            self.log.emit("Időzítés nem sikerült (nem találtam jól elkülönülő frázisokat) - felismerés egyben.")
         tmp = DAW_DIR / "temp" / f"asr_{new_id()}.wav"
         tmp.parent.mkdir(parents=True, exist_ok=True)
         with PBAudioFile(str(tmp), "w", 16000, 1, bit_depth=16) as f:
@@ -890,18 +895,60 @@ class GenWorker(QThread):
                 tmp.unlink()
             except OSError:
                 pass
-        text = (res.get("text") or "").strip()
-        lang = ""
-        m_ = re.match(r"^\s*language\s+(\w+)\s*<asr_text>(.*)$", text, re.S | re.I)
-        if m_:
-            lang, text = m_.group(1), m_.group(2).strip()
-        text = text.replace("<asr_text>", " ").strip()
+        text, lang = clean_asr_text(res.get("text") or "")
         if not text:
             raise ApiError("A Qwen3-ASR nem ismert fel szöveget (lehet, hogy instrumentális a dal).")
         if cfg.get("unload_other_model", True):
             api.unload("qwen3_asr")
         self.log.emit(f"✓ Szöveg felismerve ({len(text.split())} szó).")
         self.asr_done.emit(text, job.get("language") or lang)
+
+    def _do_asr_timed(self, job: dict, api, cfg, mono):
+        """Frázisonkénti felismerés: az éneket a levegővételeknél darabolja, és minden darabot külön ismer fel.
+        Így minden sor pontosan egy énekelt frázis lesz, időbélyeggel."""
+        sr = 16000
+        phrases = detect_vocal_phrases(mono, sr)
+        if len(phrases) < 2:
+            return False
+        self.log.emit(f"{len(phrases)} énekelt frázist találtam - felismerés frázisonként…")
+        try:
+            api.ensure("qwen3_asr", job["model"], "qwen3_asr", "asr", {}, cfg.get("unload_other_model", True),
+                       self.log.emit)
+        except Exception as e:
+            raise ApiError(f"A Qwen3-ASR modell nem töltődött be ({e}). Lehet, hogy a telepített motor ezt még nem "
+                           "ismeri - frissítsd a motort a Telepítés fülön.")
+        tmpdir = DAW_DIR / "temp"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        lines, lang = [], ""
+        for i, (a, b) in enumerate(phrases):
+            lo, hi = max(0, int((a - 0.15) * sr)), min(len(mono), int((b + 0.15) * sr))
+            chunk = mono[lo:hi]
+            tmp = tmpdir / f"asr_{new_id()}.wav"
+            with PBAudioFile(str(tmp), "w", sr, 1, bit_depth=16) as f:
+                f.write(np.ascontiguousarray(chunk[None, :]))
+            try:
+                req = {"audio": fwd(tmp), "text": ""}
+                if job.get("language"):
+                    req["language"] = job["language"]
+                res = api.run("qwen3_asr", req)
+            finally:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            text, lg = clean_asr_text(res.get("text") or "")
+            lang = lang or lg
+            if text:
+                lines.append({"start": round(a, 2), "end": round(b, 2), "text": text})
+            if (i + 1) % 5 == 0 or i + 1 == len(phrases):
+                self.log.emit(f"  … {i + 1}/{len(phrases)} frázis")
+        if not lines:
+            return False
+        if cfg.get("unload_other_model", True):
+            api.unload("qwen3_asr")
+        self.log.emit(f"✓ {len(lines)} időzített sor felismerve.")
+        self.asr_timed.emit(lines, job.get("language") or lang, len(mono) / sr)
+        return True
 
     def _do_sheetsage(self, job: dict):
         cfg = self.get_cfg()
@@ -5026,6 +5073,97 @@ REMAKE_STYLES = {
 }
 
 
+def detect_vocal_phrases(mono16k, sr: int = 16000) -> list[tuple[float, float]]:
+    """Ének-frázisok (sorok) keresése a hangerő alapján: ahol az énekes levegőt vesz / szünetet tart, ott vágunk.
+    Bemenet: leválasztott ének, mono float tömb. Kimenet: [(kezdet_mp, vég_mp), …]."""
+    x = np.asarray(mono16k, dtype=np.float32).ravel()
+    hop = int(sr * 0.02)
+    n = len(x) // hop
+    if n < 10:
+        return []
+    rms = np.sqrt(np.mean(x[:n * hop].reshape(n, hop) ** 2, axis=1) + 1e-12)
+    db = 20 * np.log10(rms + 1e-9)
+    db = np.convolve(db, np.ones(3) / 3, mode="same")          # 60 ms simítás
+    floor, top = np.percentile(db, 20), np.percentile(db, 97)
+    if top - floor < 6:
+        return []
+    thr = floor + 0.35 * (top - floor)
+    on = db > thr
+    segs, i = [], 0
+    while i < n:
+        if on[i]:
+            j = i
+            while j < n and on[j]:
+                j += 1
+            segs.append([i, j])
+            i = j
+        else:
+            i += 1
+    merged = []                                                  # rövid (< 0,2 mp) szünetek összevonása
+    for a, b in segs:
+        if merged and a - merged[-1][1] < 10:
+            merged[-1][1] = b
+        else:
+            merged.append([a, b])
+    merged = [m_ for m_ in merged if m_[1] - m_[0] >= 20]       # < 0,4 mp: zaj
+    out = []
+
+    def split(a, b):                                             # túl hosszú (> 9 mp) frázis: a leghalkabb ponton vágjuk
+        if b - a <= 450:
+            out.append((a, b))
+            return
+        lo, hi = a + 100, b - 100
+        k = lo + int(np.argmin(db[lo:hi]))
+        split(a, k)
+        split(k, b)
+
+    for a, b in merged:
+        split(a, b)
+    return [(a * hop / sr, b * hop / sr) for a, b in out]
+
+
+def structure_timed_lyrics(lines: list[dict], total: float = 0.0) -> str:
+    """Időzített sorokból tagolt dalszöveg: hosszú szünetnél új szakasz, az ismétlődő szakasz a refrén."""
+    lines = [l for l in lines if (l.get("text") or "").strip()]
+    if not lines:
+        return ""
+    blocks, cur = [], [lines[0]]
+    for prev, l in zip(lines, lines[1:]):
+        gap = l["start"] - prev["end"]
+        if gap > 2.8 or len(cur) >= 8:
+            blocks.append(cur)
+            cur = [l]
+        else:
+            cur.append(l)
+    blocks.append(cur)
+    norm = lambda t: re.sub(r"[^\w ]", "", t.lower()).strip()
+    counts: dict[str, int] = {}
+    for b in blocks:
+        for l in b:
+            counts[norm(l["text"])] = counts.get(norm(l["text"]), 0) + 1
+    out = []
+    if lines[0]["start"] > 6:
+        out.append("[Intro]")
+    for b in blocks:
+        rep_ = sum(1 for l in b if counts[norm(l["text"])] > 1)
+        out.append("[Chorus]" if rep_ >= max(1, len(b) // 2 + (len(b) % 2)) else "[Verse]")
+        for l in b:
+            t = l["text"].strip().rstrip(",;")
+            out.append(t[:1].upper() + t[1:])
+    if total and total - lines[-1]["end"] > 6:
+        out.append("[Outro]")
+    return "\n".join(out)
+
+
+def clean_asr_text(text: str) -> tuple[str, str]:
+    text = (text or "").strip()
+    lang = ""
+    m_ = re.match(r"^\s*language\s+(\w+)\s*<asr_text>(.*)$", text, re.S | re.I)
+    if m_:
+        lang, text = m_.group(1), m_.group(2).strip()
+    return text.replace("<asr_text>", " ").strip(), lang
+
+
 def auto_structure_lyrics(text: str) -> str:
     """Felismert (tagolatlan) szöveg -> sorok + [Verse]/[Chorus] címkék. Az ismétlődő sorok refrénnek számítanak."""
     t = re.sub(r"\s+", " ", text).strip()
@@ -5090,6 +5228,7 @@ class RemakePanel(QWidget):
         self.vocals = ""
         self.abc = ""
         self.src_len = 0.0
+        self.timed: list[dict] = []
         self.auto_chain = False
         self.jobs: set[int] = set()
         REMAKE_DIR.mkdir(exist_ok=True)
@@ -5248,6 +5387,24 @@ class RemakePanel(QWidget):
         r.addWidget(QLabel("Nyelv:"))
         r.addWidget(self.cb_lang)
         r.addWidget(self.btn_asr)
+        r.addStretch()
+        l4.addLayout(r)
+        r = QHBoxLayout()
+        self.chk_timed = QCheckBox("Időzített felismerés (sorok az eredeti levegővételeinél)")
+        self.chk_timed.setChecked(True)
+        self.chk_timed.setToolTip(tip_html("Időzített felismerés|A leválasztott éneket ott darabolja fel, ahol az "
+                                           "énekes levegőt vesz, és minden darabot külön ismer fel. Így minden sor "
+                                           "pontosan egy énekelt frázis, a szakaszhatárok a hosszabb szüneteknél "
+                                           "vannak - a szöveg sokkal jobban illik a dallamhoz, kevesebb az ugrálás.\n"
+                                           "Leválasztott ének kell hozzá (2. lépés). Kicsit lassabb."))
+        self.btn_timing = QPushButton("⏱ Időzítés…")
+        self.btn_timing.setEnabled(False)
+        self.btn_timing.setToolTip(tip_html("Időzítés|Táblázat: melyik sor hányadik másodpercnél és hányadik "
+                                            "ütemnél kezdődik az eredetiben. Ellenőrzéshez, és ha kézzel "
+                                            "szeretnéd igazítani a sorokat."))
+        self.btn_timing.clicked.connect(self.show_timing)
+        r.addWidget(self.chk_timed)
+        r.addWidget(self.btn_timing)
         r.addStretch()
         l4.addLayout(r)
         r = QHBoxLayout()
@@ -5538,12 +5695,18 @@ class RemakePanel(QWidget):
         src = self.vocals or self.work_src
         self.say("Dalszöveg felismerése" + (" a leválasztott énekből…" if self.vocals else " a teljes dalból…"))
         self.main.job_counter += 1
+        timed = self.chk_timed.isChecked() and bool(self.vocals)
+        if self.chk_timed.isChecked() and not self.vocals:
+            self.say("Időzítéshez leválasztott ének kell - most időzítés nélkül ismerem fel.")
         self.main.worker.add({"id": self.main.job_counter, "kind": "asr", "audio": src, "model": str(self.asr_model()),
-                              "language": self.cb_lang.currentData()})
+                              "language": self.cb_lang.currentData(), "timed": timed})
         self.main._update_queue_label()
 
-    def on_asr(self, text: str, lang: str):
-        self.ed_lyrics.setPlainText(auto_structure_lyrics(text))
+    def on_asr(self, text: str, lang: str, keep_text: bool = False):
+        if not keep_text:
+            self.timed = []
+            self.btn_timing.setEnabled(False)
+            self.ed_lyrics.setPlainText(auto_structure_lyrics(text))
         self.step(3, "ok")
         self.say(f"✓ Szöveg felismerve{(' (' + lang + ')') if lang else ''} - nézd át és javítsd!")
         if lang:
@@ -5552,6 +5715,71 @@ class RemakePanel(QWidget):
                 if self.cb_lang_tag.itemData(i) and self.cb_lang_tag.itemData(i).lower().startswith(low[:3]):
                     self.cb_lang_tag.setCurrentIndex(i)
         self._chain_next(3)
+
+    def on_asr_timed(self, lines: list, lang: str, total: float):
+        self.timed = lines
+        self.btn_timing.setEnabled(True)
+        self.ed_lyrics.setPlainText(structure_timed_lyrics(lines, total))
+        self.say(f"⏱ {len(lines)} időzített sor (az első {fmt_mmss(lines[0]['start'])}-nál kezdődik). "
+                 "Az ⏱ Időzítés… gombbal megnézheted, melyik sor hol szól az eredetiben.")
+        self.on_asr("", lang, keep_text=True)
+
+    def _bpm_and_meter(self) -> tuple[float, int]:
+        abc = self.ed_abc.toPlainText()
+        bpm, beats = 0.0, 4
+        m_ = re.search(r"^Q:\s*(?:\d+/\d+\s*=\s*)?(\d+(?:\.\d+)?)", abc, re.M)
+        if m_:
+            bpm = float(m_.group(1))
+        m_ = re.search(r"^M:\s*(\d+)/(\d+)", abc, re.M)
+        if m_:
+            beats = int(m_.group(1))
+        if not bpm and self.work_src:
+            try:
+                bpm = estimate_bpm(read_audio(self.work_src))
+            except Exception:
+                bpm = 0.0
+        return bpm, beats
+
+    def show_timing(self):
+        if not self.timed:
+            return
+        bpm, beats = self._bpm_and_meter()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Időzítés – melyik sor hol szól az eredetiben")
+        dlg.resize(760, 560)
+        v = QVBoxLayout(dlg)
+        head = f"Tempó: kb. {bpm:.0f} BPM, {beats} negyed / ütem. " if bpm else ""
+        info = QLabel(head + "Dupla kattintás egy sorra: az eredeti dal lejátszása attól a ponttól.")
+        info.setWordWrap(True)
+        info.setObjectName("dim")
+        v.addWidget(info)
+        tbl = QTableWidget(len(self.timed), 4)
+        tbl.setHorizontalHeaderLabels(["Kezdet", "Ütem", "Hossz", "Sor"])
+        tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        for r_, l in enumerate(self.timed):
+            bar = f"{int(l['start'] * bpm / 60 / beats) + 1}." if bpm else "–"
+            for c, val in enumerate((fmt_mmss(l["start"]), bar, f"{l['end'] - l['start']:.1f} mp", l["text"])):
+                tbl.setItem(r_, c, QTableWidgetItem(val))
+        tbl.resizeColumnsToContents()
+        tbl.cellDoubleClicked.connect(lambda r_, c: self._play_at(self.timed[r_]["start"]))
+        v.addWidget(tbl, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.button(QDialogButtonBox.Close).setText("Bezárás")
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        install_tip_filter(dlg)
+        dlg.exec()
+
+    def _play_at(self, sec: float):
+        src = self.work_src or self.src
+        if not src:
+            return
+        self.main.play_file(src, "Eredeti")
+        if self.main.player:
+            QTimer.singleShot(150, lambda: self.main.player.setPosition(int(sec * 1000)))
 
     def ollama_rewrite(self):
         m = self.main
@@ -5697,6 +5925,7 @@ class RemakePanel(QWidget):
                 "voice": self.cb_voice.currentIndex(), "lang_tag": self.cb_lang_tag.currentIndex(),
                 "custom": self.ed_style.text(), "n": self.sp_n.value(), "cot": self.cb_cot.currentIndex(),
                 "title": self.ed_title.text(), "same_len": self.chk_same_len.isChecked(),
+                "timed": self.timed, "timed_on": self.chk_timed.isChecked(),
                 "results": [int(self.lst.item(i).data(Qt.UserRole)) for i in range(self.lst.count())]}
 
     def set_state(self, st: dict):
@@ -5742,6 +5971,9 @@ class RemakePanel(QWidget):
         self.cb_cot.setCurrentIndex(int(st.get("cot", 0)))
         self.ed_title.setText(st.get("title", ""))
         self.chk_same_len.setChecked(bool(st.get("same_len", True)))
+        self.timed = list(st.get("timed") or [])
+        self.btn_timing.setEnabled(bool(self.timed))
+        self.chk_timed.setChecked(bool(st.get("timed_on", True)))
         self.lst.clear()
         for tid in st.get("results") or []:
             t = self.main.db.get(int(tid))
@@ -6164,6 +6396,7 @@ class MainWindow(QMainWindow):
         self.worker.midi_done.connect(self._midi_done)
         self.worker.task_failed.connect(self._task_failed)
         self.worker.asr_done.connect(lambda t, l: self.remake and self.remake.on_asr(t, l))
+        self.worker.asr_timed.connect(lambda ls, l, tot: self.remake and self.remake.on_asr_timed(ls, l, tot))
         self.worker.remake_abc.connect(lambda a: self.remake and self.remake.on_abc(a))
         self.worker.start()
 
@@ -8630,6 +8863,9 @@ projekt dalait mutatja; a <b>🧹 Könyvtár ürítése…</b> törli a dalokat 
 <li><b>Tallózás…</b> – MP3/WAV/FLAC… Hosszú dalnál pipáld be a <b>Csak egy részlet</b>-et (60–90 mp ideális).</li>
 <li><b>⚡ 2–4. lépés egyben</b> – ének leválasztása (HTDemucs), dallam + akkordok (SheetSage2),
 dalszöveg-felismerés (Qwen3-ASR).</li>
+<li>Az <b>Időzített felismerés</b> (alapból be) a levegővételeknél bontja sorokra a szöveget – így jobban illik a
+dallamhoz. Az <b>⏱ Időzítés…</b> gomb megmutatja, melyik sor hányadik másodpercnél / ütemnél szól az eredetiben.
+Időpontot a szövegbe ne írj: a YuE2 nem érti, elénekelné.</li>
 <li><b>Nézd át</b> a felismert szöveget – javítsd, írj újat, vagy fordíttasd le (Ollama).</li>
 <li>Pipálj be <b>egy vagy több stílust</b>, válassz énekhangot és az ének nyelvét.</li>
 <li><b>▶ Átdolgozás indítása</b> – stílusonként N változat. Jobb oldalt dupla kattintással meghallgatod.</li>
