@@ -1558,6 +1558,7 @@ def tip_html(text: str) -> str:
 # üzenet és napló fordítva jelenik meg. Magyarnál semmi sem változik.
 # ---------------------------------------------------------------------------
 LANG_DIR = APP_DIR / "lang"
+LANG_URL = "https://raw.githubusercontent.com/sanyi1963bp/yue2-studio/main/lang/"
 UI_LANGS = [("hu", "Magyar"), ("en", "English"), ("de", "Deutsch"), ("fr", "Français"), ("rom", "Romani (lovári)")]
 I18N: dict[str, str] = {}
 _I18N_RE = None
@@ -8483,8 +8484,10 @@ class MainWindow(QMainWindow):
         code = self.cb_ui_lang.currentData()
         if code == self.cfg.get("ui_lang", "hu"):
             return
-        if code != "hu" and not (LANG_DIR / f"{code}.json").is_file():
-            QMessageBox.warning(self, "Felület nyelve", f"Hiányzik a nyelvi fájl: lang/{code}.json")
+        if code != "hu" and not (LANG_DIR / f"{code}.json").is_file() and not self._download_lang(code):
+            QMessageBox.warning(self, "Felület nyelve", f"Hiányzik a nyelvi fájl: lang/{code}.json\n\n"
+                                f"Letölthető innen: {LANG_URL}{code}.json\n"
+                                f"Tedd ide: {LANG_DIR}")
             self.cb_ui_lang.setCurrentIndex(max(0, self.cb_ui_lang.findData(self.cfg.get("ui_lang", "hu"))))
             return
         self.cfg["ui_lang"] = code
@@ -8492,6 +8495,26 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(self, "Felület nyelve", "Az új nyelv újraindítás után lép életbe. "
                                 "Újraindítsam most a programot? (A munkád megmarad.)") == QMessageBox.Yes:
             self._restart_app()
+
+    def _download_lang(self, code: str) -> bool:
+        """Hiányzó nyelvi fájl letöltése a GitHubról (a program mellé, a lang mappába)."""
+        if QMessageBox.question(self, "Felület nyelve", f"A(z) lang/{code}.json nyelvi fájl nincs meg a gépen.\n"
+                                "Letöltsem most a GitHubról? (kb. 150 KB)") != QMessageBox.Yes:
+            return False
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            req = urllib.request.Request(LANG_URL + f"{code}.json", headers={"User-Agent": "YuE2Studio"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = r.read()
+            json.loads(data.decode("utf-8"))          # ellenőrzés: érvényes JSON
+            LANG_DIR.mkdir(parents=True, exist_ok=True)
+            (LANG_DIR / f"{code}.json").write_bytes(data)
+            return True
+        except Exception as e:
+            QMessageBox.warning(self, "Felület nyelve", f"Nem sikerült letölteni: {e}")
+            return False
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _restart_app(self):
         self._restarting = True
