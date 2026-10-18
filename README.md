@@ -72,12 +72,22 @@ Részletes, képes, magyar nyelvű kézikönyv: [docs/YuE2_Studio_Kezikonyv.pdf]
 
 ## Licenc
 
-Az app kódja és a kézikönyv **szabad**: közkincs ([Unlicense](LICENSE)). Bárki bármire felhasználhatja, másolhatja,
-módosíthatja, eladhatja, engedélykérés és névfeltüntetés nélkül.
+**Mindent szabad – éljen a szoftverek szabadsága!** 🕊️
+
+Az app kódja és a kézikönyv **közkincs** ([Unlicense](LICENSE)). Ez a létező legszabadabb licenc, semmit nem tilt:
+
+- **Bárki, bármire** felhasználhatja: otthon, munkában, oktatásban, akár pénzért is.
+- **Szabadon másolható, módosítható, továbbadható és eladható.**
+- **Nem kell engedélyt kérni**, és még a szerző nevét sem kötelező feltüntetni.
+  Az MIT licenc ezt megkövetelné, az Unlicense ezt sem kéri.
+
+Egyetlen kikötése: **nincs garancia**. A program úgy van, ahogy van, és ha valami nem működik, senki nem vonható
+felelősségre.
 
 ### A modellekre más szabályok vonatkoznak
 
-
+Az app szabadsága nem terjed ki azokra a modellekre, amelyeket a program letölt és használ. Azok mások munkái,
+a saját licencükkel:
 - A **YuE2** modellsúlyok és a Mothersuperior LoRA-k licence **CC BY-NC 4.0**, vagyis csak nem kereskedelmi célra
   használhatók.
 - Az audio.cpp licence MIT, a PySide6-é LGPL.
