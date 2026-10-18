@@ -9,7 +9,7 @@ videókártyádon fut, az [audio.cpp](https://github.com/audio-cpp/audio.cpp) sz
 
 | Fül | Mire való |
 |---|---|
-| 🎵 **Generálás** | Dalszöveg + stílus → kész dal. COT módok, seed, sorozatok, presetek, haladó paraméterek, LoRA-k, feladatsor |
+| 🎵 **Generálás** | Dalszöveg + stílus → kész dal. Dal hossza csúszkával (15 mp – 6 perc), COT módok, seed, sorozatok, presetek, haladó paraméterek, LoRA-k, feladatsor |
 | 🔁 **Átdolgozás** | Meglévő dal (MP3/WAV) új stílusban: ének leválasztása, dallam és akkordok kinyerése, dalszöveg-felismerés, generálás több stílusban egyszerre |
 | 🎼 **ABC-kotta** | A dal zenei terve (dallam + akkordok): szerkesztés, hosszabbítás, kinyerés hangfájlból |
 | 📚 **Könyvtár** | Minden generált szám: lejátszás, keresés, kedvencek, megjegyzés, MP3 export, beállítások visszatöltése |

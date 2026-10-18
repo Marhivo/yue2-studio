@@ -59,7 +59,7 @@ except Exception:  # pragma: no cover
     HAS_MULTIMEDIA = False
 
 APP_NAME = "YuE2 Studio"
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 IS_WINDOWS = sys.platform == "win32"
 NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 
@@ -1443,7 +1443,35 @@ SAMPLING_EXTRA = {
     "sem": "Semantic sampling - a zenei hangtokenek generálása (a végső hangzást befolyásolja).",
     "abc": "ABC planner sampling - a zenei terv (kotta) generálása; csak melody/full módban, ha a modell tervez.",
 }
-SEM_MAX_EXTRA = " A semantic max tokens a szám maximális hosszát is megszabja: többel hosszabb dal lehetséges."
+TOKENS_PER_SEC = 25   # YuE2: 48 kHz / 1920-as VAE lépték = 25 latens képkocka (semantic token) másodpercenként
+
+
+def fmt_mmss(sec: float) -> str:
+    sec = int(round(sec))
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+def estimate_lyrics_seconds(text: str) -> float | None:
+    """Durva becslés: mennyi ideig tart elénekelni a szöveget (+ intro/outro/szóló szakaszok)."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return None
+    total, sung = 0.0, 0
+    for l in lines:
+        m_ = re.match(r"^\[(.+)\]$", l)
+        if m_:
+            tag = m_.group(1).lower()
+            if "instrumental" in tag and len(lines) <= 2:
+                return None
+            total += 10 if any(k in tag for k in ("intro", "outro", "solo", "instrumental", "break")) else 2
+        else:
+            sung += 1
+            total += max(3.0, 0.55 * len(re.findall(r"\w+", l)) + 1.2)
+    return total if sung else None
+
+
+SEM_MAX_EXTRA = (" A semantic max tokens a szám maximális hosszát is megszabja (25 token = 1 mp). Egyszerűbb a "
+                 "„Dal hossza” csúszka - ha az be van kapcsolva, ez a mező nem számít.")
 
 ARENA_TIP = ("Szakértői beállítás: a GPU memóriaterület mérete ehhez a részhez (MB). Csak akkor módosítsd, "
              "ha a naplóban memória (arena / allocation) hiba jelenik meg. Kikapcsolva az alapérték él.")
@@ -5061,6 +5089,7 @@ class RemakePanel(QWidget):
         self.work_src = ""       # (részlet) WAV, amivel dolgozunk
         self.vocals = ""
         self.abc = ""
+        self.src_len = 0.0
         self.auto_chain = False
         self.jobs: set[int] = set()
         REMAKE_DIR.mkdir(exist_ok=True)
@@ -5292,11 +5321,17 @@ class RemakePanel(QWidget):
         self.btn_go.setToolTip(tip_html("Indítás|Minden kiválasztott stílusból elkészíti a változatokat a "
                                         "feladatsorban. Az eredmények a jobb oldalon és a Könyvtárban jelennek meg."))
         self.btn_go.clicked.connect(self.start)
+        self.chk_same_len = QCheckBox("Hossz = eredeti")
+        self.chk_same_len.setChecked(True)
+        self.chk_same_len.setToolTip(tip_html("Hossz = eredeti|Az új változat nagyjából olyan hosszú lesz, mint az "
+                                              "eredeti dal (vagy a kijelölt részlet). Kikapcsolva a Generálás fül "
+                                              "„Dal hossza” beállítása érvényes."))
         l6.addWidget(QLabel("Stílusonként:"))
         l6.addWidget(self.sp_n)
         l6.addWidget(self.cb_cot)
         l6.addWidget(self.ed_title, 1)
         l6b = QHBoxLayout()
+        l6b.addWidget(self.chk_same_len)
         l6b.addStretch()
         l6b.addWidget(self.btn_go)
         l6v.addLayout(l6b)
@@ -5409,6 +5444,7 @@ class RemakePanel(QWidget):
                 self.work_src = self.src
             bpm = estimate_bpm(seg)
             L = seg.shape[1] / DAW_SR
+            self.src_len = L
             self.lbl_info.setText(f"Hossz: {int(L // 60)}:{int(L % 60):02d}" + (f" (teljes: {int(total // 60)}:{int(total % 60):02d})"
                                   if self.chk_part.isChecked() else "") + f" · tempó kb. {bpm:.0f} BPM")
             if L > 150:
@@ -5616,7 +5652,8 @@ class RemakePanel(QWidget):
         for name, style in sts:
             jids = self.main.enqueue_custom(lyrics=lyrics, style=style, abc=abc, cot=self.cb_cot.currentData(),
                                             count=self.sp_n.value(), title=f"{title} – {name}",
-                                            instrumental=self.chk_instr.isChecked())
+                                            instrumental=self.chk_instr.isChecked(),
+                                            length_sec=int(self.src_len) + 5 if self.chk_same_len.isChecked() and self.src_len else None)
             self.jobs.update(jids)
             n_total += len(jids)
         self.step(4, "ok")
@@ -5659,7 +5696,7 @@ class RemakePanel(QWidget):
                 "styles": [n for n, cb in self.style_checks.items() if cb.isChecked()],
                 "voice": self.cb_voice.currentIndex(), "lang_tag": self.cb_lang_tag.currentIndex(),
                 "custom": self.ed_style.text(), "n": self.sp_n.value(), "cot": self.cb_cot.currentIndex(),
-                "title": self.ed_title.text(),
+                "title": self.ed_title.text(), "same_len": self.chk_same_len.isChecked(),
                 "results": [int(self.lst.item(i).data(Qt.UserRole)) for i in range(self.lst.count())]}
 
     def set_state(self, st: dict):
@@ -5667,6 +5704,7 @@ class RemakePanel(QWidget):
         self.jobs.clear()
         self.src = st.get("src", "")
         self.work_src = ""
+        self.src_len = 0.0
         self.ed_file.setText(self.src)
         for w_ in (self.chk_part, self.sp_from, self.sp_to):
             w_.blockSignals(True)
@@ -5703,6 +5741,7 @@ class RemakePanel(QWidget):
         self.sp_n.setValue(int(st.get("n", 2)))
         self.cb_cot.setCurrentIndex(int(st.get("cot", 0)))
         self.ed_title.setText(st.get("title", ""))
+        self.chk_same_len.setChecked(bool(st.get("same_len", True)))
         self.lst.clear()
         for tid in st.get("results") or []:
             t = self.main.db.get(int(tid))
@@ -6203,7 +6242,7 @@ class MainWindow(QMainWindow):
         self._apply_tooltips()
         self.proj_timer = QTimer(self)
         self.proj_timer.timeout.connect(self._update_project_label)
-        self.proj_timer.start(1500)
+        self.proj_timer.start(3000)
         for seq, fn in (("Ctrl+S", self.save_project), ("Ctrl+Shift+S", lambda: self.save_project(True)),
                         ("Ctrl+O", self.open_project), ("Ctrl+N", self.new_project)):
             sc = QShortcut(QKeySequence(seq), self)
@@ -6330,6 +6369,62 @@ class MainWindow(QMainWindow):
         r.addStretch()
         mdl.addRow("Súly tárolás:", r)
         fl.addWidget(g_md)
+
+        # Dal hossza
+        g_len = QGroupBox("Dal hossza")
+        lenl = QVBoxLayout(g_len)
+        r = QHBoxLayout()
+        self.chk_len = QCheckBox("Hossz korlátozása:")
+        self.chk_len.setToolTip(tip_html("Hossz korlátozása|Bekapcsolva a dal legfeljebb a csúszkán beállított hosszú "
+                                         "lesz. Kikapcsolva a szöveg hossza dönt (felső határ kb. 6 perc).\n"
+                                         "Ének nélküli (instrumentális) dalnál erősen ajánlott, mert ott nincs szöveg, "
+                                         "amihez a modell igazodhatna."))
+        self.sl_len = QSlider(Qt.Horizontal)
+        self.sl_len.setRange(15, 360)
+        self.sl_len.setSingleStep(5)
+        self.sl_len.setPageStep(30)
+        self.sl_len.setValue(150)
+        self.sl_len.setToolTip(tip_html("Dal hossza|Húzd a kívánt hosszra (15 másodperctől 6 percig). Nyilakkal "
+                                        "5 másodpercenként, PageUp/PageDown-nal fél percenként léptethető."))
+        self.sp_len = QSpinBox()
+        self.sp_len.setRange(15, 360)
+        self.sp_len.setSingleStep(5)
+        self.sp_len.setSuffix(" mp")
+        self.sp_len.setValue(150)
+        self.sp_len.setToolTip(tip_html("Hossz másodpercben|Pontos érték begépelése."))
+        self.sl_len.valueChanged.connect(self.sp_len.setValue)
+        self.sp_len.valueChanged.connect(self.sl_len.setValue)
+        self.lbl_len = QLabel("")
+        self.lbl_len.setMinimumWidth(70)
+        self.lbl_len.setToolTip(tip_html("Hossz|Perc:másodperc formában, és hogy ez hány tokennek felel meg "
+                                         "(25 token = 1 másodperc)."))
+        r.addWidget(self.chk_len)
+        r.addWidget(self.sl_len, 1)
+        r.addWidget(self.sp_len)
+        r.addWidget(self.lbl_len)
+        lenl.addLayout(r)
+        r = QHBoxLayout()
+        self.chk_len_min = QCheckBox("Ne legyen sokkal rövidebb (legalább a 85%-a)")
+        self.chk_len_min.setChecked(True)
+        self.chk_len_min.setToolTip(tip_html("Legalább ennyi|Bekapcsolva a modell nem fejezheti be a dalt a "
+                                             "beállított hossz 85%-a előtt. Így pl. 2:00-nál 1:42 és 2:00 közötti "
+                                             "dal lesz. Kikapcsolva rövidebb is lehet, ha hamar elfogy a szöveg."))
+        r.addWidget(self.chk_len_min)
+        r.addStretch()
+        lenl.addLayout(r)
+        self.lbl_len_hint = QLabel("")
+        self.lbl_len_hint.setWordWrap(True)
+        self.lbl_len_hint.setObjectName("dim")
+        self.lbl_len_hint.setToolTip(tip_html("Becslés|A dalszöveg alapján becsült hossz összevetése a beállítással. "
+                                              "Csak tájékoztató: a valódi hossz a tempótól és a stílustól is függ."))
+        lenl.addWidget(self.lbl_len_hint)
+        for w_ in (self.sl_len, self.sp_len, self.chk_len_min):
+            w_.setEnabled(False)
+        self.chk_instr.toggled.connect(self._length_hint)
+        self.chk_len.toggled.connect(lambda on: [w_.setEnabled(on) for w_ in (self.sl_len, self.sp_len, self.chk_len_min)])
+        for sig in (self.chk_len.toggled, self.sl_len.valueChanged, self.chk_len_min.toggled):
+            sig.connect(self._length_hint)
+        fl.addWidget(g_len)
 
         # Seed + mennyiség
         g_sd = QGroupBox("Seed és mennyiség")
@@ -6539,7 +6634,39 @@ class MainWindow(QMainWindow):
         lines = [l for l in t.splitlines() if l.strip()]
         sections = [l for l in lines if re.match(r"^\s*\[.+\]\s*$", l)]
         words = len(re.findall(r"\w+", "\n".join(l for l in lines if l not in sections)))
-        self.lbl_lyrics.setText(f"{len(sections)} szakasz · {len(lines) - len(sections)} sor · {words} szó")
+        est = estimate_lyrics_seconds(t)
+        self.lbl_lyrics.setText(f"{len(sections)} szakasz · {len(lines) - len(sections)} sor · {words} szó"
+                                + (f" · kb. {fmt_mmss(est)} ének" if est else ""))
+        if hasattr(self, "lbl_len_hint"):
+            self._length_hint()
+
+    def _length_hint(self, *_):
+        if not hasattr(self, "lbl_len_hint"):
+            return
+        sec = self.sl_len.value()
+        self.lbl_len.setText(f"{fmt_mmss(sec)}  ({sec * TOKENS_PER_SEC} token)")
+        est = estimate_lyrics_seconds(self.ed_lyrics.toPlainText())
+        instr = self.chk_instr.isChecked() or est is None
+        on = self.chk_len.isChecked()
+        col, msg = "#a8a9b3", ""
+        if not on:
+            if instr:
+                col, msg = "#facc15", ("⚠ Nincs (énekelt) szöveg: a modell nem tudja, mikor fejezze be, ezért akár "
+                                       "6 perces dal is lehet, és sokáig tart. Kapcsold be a hossz korlátozását!")
+            else:
+                msg = f"A szöveg alapján kb. {fmt_mmss(est)} ének + intro/outro. Felső határ korlátozás nélkül: kb. 6 perc."
+        elif instr:
+            msg = f"Instrumentális: kb. {fmt_mmss(sec * (0.85 if self.chk_len_min.isChecked() else 0.3))}–{fmt_mmss(sec)} hosszú lesz."
+        elif est > sec * 1.1:
+            col, msg = "#f87171", (f"⚠ A szöveg kb. {fmt_mmss(est)} – a beállított korlát ({fmt_mmss(sec)}) valószínűleg "
+                                   "levágja a végét (befejezés nélkül). Rövidítsd a szöveget, vagy növeld a hosszt.")
+        elif self.chk_len_min.isChecked() and est < sec * 0.6:
+            col, msg = "#facc15", (f"A szöveg csak kb. {fmt_mmss(est)} – a dal hosszabb lesz nála: a modell "
+                                   "hangszeres részekkel vagy ismétléssel tölti ki.")
+        else:
+            col, msg = "#4ade80", f"✓ A szöveg (kb. {fmt_mmss(est)}) jól illik a beállított hosszhoz ({fmt_mmss(sec)})."
+        self.lbl_len_hint.setText(msg)
+        self.lbl_len_hint.setStyleSheet(f"color:{col};")
 
     def _tags(self) -> list[str]:
         return [t.strip() for t in self.ed_style.text().split(",") if t.strip()]
@@ -6623,6 +6750,8 @@ class MainWindow(QMainWindow):
             "arena": {k: w.value() for k, w in self.opt_arena.items()},
             "ar_lora": self.cb_ar_lora.currentText(), "ar_scale": self.sp_ar_scale.value(),
             "nar_lora": self.cb_nar_lora.currentText(), "nar_scale": self.sp_nar_scale.value(),
+            "length_on": self.chk_len.isChecked(), "length_sec": self.sl_len.value(),
+            "length_min": self.chk_len_min.isChecked(),
         }
 
     def set_form(self, f: dict):
@@ -6665,6 +6794,10 @@ class MainWindow(QMainWindow):
         set_combo_text(self.cb_nar_lora, f.get("nar_lora"))
         self.sp_ar_scale.setValue(float(f.get("ar_scale", 1.0)))
         self.sp_nar_scale.setValue(float(f.get("nar_scale", 1.0)))
+        self.chk_len.setChecked(bool(f.get("length_on", False)))
+        self.sl_len.setValue(int(f.get("length_sec", 150)))
+        self.chk_len_min.setChecked(bool(f.get("length_min", True)))
+        self._length_hint()
 
     def _reset_form(self):
         self.set_form({"lyrics": LYRICS_EXAMPLE, "style": STYLE_EXAMPLE, "cot": "full", "random_seed": True,
@@ -6707,6 +6840,11 @@ class MainWindow(QMainWindow):
         for k, v in f["sem"].items():
             if v is not None:
                 opts[f"semantic_{k}"] = v
+        if f.get("length_on"):
+            mx = int(f.get("length_sec", 150)) * TOKENS_PER_SEC
+            opts["semantic_max_tokens"] = mx
+            mn = int(mx * 0.85) if f.get("length_min", True) else min(int(opts.get("semantic_min_tokens") or 200), mx)
+            opts["semantic_min_tokens"] = mn
         if f["cot"] != "off":
             for k, v in f["abc"].items():
                 if v is not None:
@@ -6758,7 +6896,7 @@ class MainWindow(QMainWindow):
         save_settings(self.cfg)
 
     def enqueue_custom(self, lyrics: str, style: str, abc: str, cot: str, count: int, title: str,
-                       instrumental: bool = False) -> list[int]:
+                       instrumental: bool = False, length_sec: int | None = None) -> list[int]:
         """Generálás a Generálás fül haladó beállításaival, de megadott szöveggel/stílussal/tervvel (Átdolgozás)."""
         f = self.get_form()
         if not f["main"] or not f["vae"]:
@@ -6767,6 +6905,8 @@ class MainWindow(QMainWindow):
         f.update({"lyrics": lyrics, "style": style, "cot": cot if abc else ("full" if instrumental else "off"),
                   "instrumental": instrumental, "use_abc": False, "title": title, "batch": max(1, int(count)),
                   "batch_mode": "rand", "random_seed": True})
+        if length_sec:
+            f.update({"length_on": True, "length_sec": int(max(15, min(360, length_sec))), "length_min": True})
         opts = self._build_options(f)
         if abc:
             opts["abc"] = abc
