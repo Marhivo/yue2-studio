@@ -59,7 +59,7 @@ except Exception:  # pragma: no cover
     HAS_MULTIMEDIA = False
 
 APP_NAME = "YuE2 Studio"
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 IS_WINDOWS = sys.platform == "win32"
 NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 
@@ -87,6 +87,7 @@ DEFAULT_SETTINGS = {
     "ollama_url": "http://127.0.0.1:11434",
     "ollama_model": "",
     "show_tooltips": True,
+    "ui_lang": "hu",
     "tour_offered": False,
     "last_form": {},
 }
@@ -1535,6 +1536,7 @@ def clear_button(fn, what: str) -> QPushButton:
 
 
 def tip_html(text: str) -> str:
+    text = tr(text)
     if "|" in text:
         title, body = text.split("|", 1)
     else:
@@ -1546,6 +1548,182 @@ def tip_html(text: str) -> str:
     if width:
         return f"<qt><table width='{width}' cellspacing='0' cellpadding='0'><tr><td>{head}{paras}</td></tr></table></qt>"
     return f"<qt>{head}{paras}</qt>"
+
+
+
+# ---------------------------------------------------------------------------
+# Felület nyelve (i18n). A forrásnyelv a magyar; a fordítások a lang/<kód>.json fájlokban vannak
+# ({"magyar szöveg": "fordítás", ...}). Bárki szerkesztheti / javíthatja őket szövegszerkesztővel.
+# Nem magyar nyelvnél a Qt szövegbeállító függvényeit becsomagoljuk, így minden felirat, buborék,
+# üzenet és napló fordítva jelenik meg. Magyarnál semmi sem változik.
+# ---------------------------------------------------------------------------
+LANG_DIR = APP_DIR / "lang"
+UI_LANGS = [("hu", "Magyar"), ("en", "English"), ("de", "Deutsch"), ("fr", "Français"), ("rom", "Romani (lovári)")]
+I18N: dict[str, str] = {}
+_I18N_RE = None
+_I18N_FRAG: dict[str, str] = {}
+
+
+def tr(s):
+    """Fordítás: pontos egyezés, különben a szövegben lévő ismert részletek cseréje."""
+    if not I18N or not isinstance(s, str) or not s:
+        return s
+    t = I18N.get(s)
+    if t is not None:
+        return t
+    if _I18N_RE is None:
+        return s
+    return _I18N_RE.sub(lambda m_: _I18N_FRAG.get(m_.group(0), m_.group(0)), s)
+
+
+def load_language(code: str) -> bool:
+    global I18N, _I18N_RE, _I18N_FRAG
+    I18N, _I18N_RE, _I18N_FRAG = {}, None, {}
+    if not code or code == "hu":
+        return True
+    f = LANG_DIR / f"{code}.json"
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    I18N = {k: v for k, v in data.items() if isinstance(v, str) and v and not k.startswith("__")}
+    I18N.update({k: v for k, v in data.items() if k.startswith("__") and isinstance(v, str)})
+    frags = sorted((k for k in I18N if len(k) >= 4 and not k.startswith("__") and "\n" not in k.strip()),
+                   key=len, reverse=True)
+    pats = []
+    for k in frags:
+        pat = re.escape(k)
+        if k[0].isalnum():
+            pat = r"(?<!\w)" + pat
+        if k[-1].isalnum():
+            pat = pat + r"(?!\w)"
+        pats.append(pat)
+    _I18N_FRAG = {k: I18N[k] for k in frags}
+    if pats:
+        _I18N_RE = re.compile("|".join(pats))
+    return True
+
+
+def translate_tree(root):
+    """A már létrehozott (konstruktorban kapott) feliratok fordítása egy ablakrészen."""
+    if not I18N or root is None:
+        return
+    from PySide6.QtWidgets import QAbstractButton, QTabWidget as _QTW
+    widgets = [root] + root.findChildren(QWidget)
+    for w_ in widgets:
+        if isinstance(w_, QLabel):
+            if w_.text():
+                _ORIG["QLabel.setText"](w_, tr(w_.text()))
+        elif isinstance(w_, QAbstractButton):
+            if w_.text():
+                _ORIG["QAbstractButton.setText"](w_, tr(w_.text()))
+        elif isinstance(w_, QGroupBox):
+            _ORIG["QGroupBox.setTitle"](w_, tr(w_.title()))
+        elif isinstance(w_, (QLineEdit, QPlainTextEdit)):
+            if w_.placeholderText():
+                w_.setPlaceholderText(w_.placeholderText())
+        elif isinstance(w_, _QTW):
+            for i in range(w_.count()):
+                _ORIG["QTabWidget.setTabText"](w_, i, tr(w_.tabText(i)))
+        if w_.toolTip() and "<qt>" not in w_.toolTip():
+            _ORIG["QWidget.setToolTip"](w_, tr(w_.toolTip()))
+        if w_.isWindow() and w_.windowTitle():
+            _ORIG["QWidget.setWindowTitle"](w_, tr(w_.windowTitle()))
+
+
+_ORIG: dict = {}
+
+
+def install_translation_hooks():
+    """Qt függvények becsomagolása, hogy a szövegek fordítva jelenjenek meg."""
+    if not I18N or _ORIG:
+        return
+    from PySide6.QtWidgets import (QAbstractButton, QMenu as _QMenu, QDialog as _QDialog, QFileDialog as _QFD,
+                                   QStatusBar as _QSB, QTextBrowser as _QTB)
+
+    def wrap(cls, name, fn):
+        _ORIG[f"{cls.__name__}.{name}"] = getattr(cls, name)
+        setattr(cls, name, fn)
+
+    O = _ORIG
+    wrap(QLabel, "setText", lambda self, t: O["QLabel.setText"](self, tr(t)))
+    wrap(QAbstractButton, "setText", lambda self, t: O["QAbstractButton.setText"](self, tr(t)))
+    wrap(QGroupBox, "setTitle", lambda self, t: O["QGroupBox.setTitle"](self, tr(t)))
+    wrap(QWidget, "setToolTip", lambda self, t: O["QWidget.setToolTip"](self, tr(t)))
+    wrap(QWidget, "setWindowTitle", lambda self, t: O["QWidget.setWindowTitle"](self, tr(t)))
+    wrap(QLineEdit, "setPlaceholderText", lambda self, t: O["QLineEdit.setPlaceholderText"](self, tr(t)))
+    wrap(QPlainTextEdit, "setPlaceholderText", lambda self, t: O["QPlainTextEdit.setPlaceholderText"](self, tr(t)))
+    wrap(QPlainTextEdit, "appendPlainText", lambda self, t: O["QPlainTextEdit.appendPlainText"](self, tr(t)))
+    wrap(_QSB, "showMessage", lambda self, t, *a: O["QStatusBar.showMessage"](self, tr(t), *a))
+
+    def _add_item(self, *a):
+        a = list(a)
+        if a and isinstance(a[0], str) and (len(a) > 1 or a[0].endswith("…")):
+            a[0] = tr(a[0])
+        return O["QComboBox.addItem"](self, *a)
+    wrap(QComboBox, "addItem", _add_item)
+    wrap(QTabWidget, "addTab", lambda self, w_, t: O["QTabWidget.addTab"](self, w_, tr(t)))
+    wrap(QTabWidget, "setTabText", lambda self, i, t: O["QTabWidget.setTabText"](self, i, tr(t)))
+    wrap(QTabWidget, "setTabToolTip", lambda self, i, t: O["QTabWidget.setTabToolTip"](self, i, tr(t)))
+    wrap(QTableWidget, "setHorizontalHeaderLabels",
+         lambda self, ls: O["QTableWidget.setHorizontalHeaderLabels"](self, [tr(x) for x in ls]))
+
+    def _add_action(self, *a):
+        a = list(a)
+        for i, x in enumerate(a):
+            if isinstance(x, str):
+                a[i] = tr(x)
+                break
+        return O["QMenu.addAction"](self, *a)
+    wrap(_QMenu, "addAction", _add_action)
+    wrap(_QMenu, "exec", lambda self, *a: (translate_tree(self), O["QMenu.exec"](self, *a))[1])
+    wrap(_QDialog, "exec", lambda self: (translate_tree(self), O["QDialog.exec"](self))[1])
+    wrap(_QTB, "setHtml", lambda self, h: O["QTextBrowser.setHtml"](
+        self, I18N.get("__HELP_HTML__", h) if h == HELP_HTML else tr(h)))
+
+    # QMessageBox: statikus függvények + példány
+    for nm in ("information", "warning", "question", "critical"):
+        f0 = getattr(QMessageBox, nm)
+        O[f"QMessageBox.{nm}"] = f0
+
+        def mk(f0):
+            def fn(parent, title, text, *a, **k):
+                return f0(parent, tr(title), tr(text), *a, **k)
+            return staticmethod(fn)
+        setattr(QMessageBox, nm, mk(f0))
+    wrap(QMessageBox, "setText", lambda self, t: O["QMessageBox.setText"](self, tr(t)))
+    wrap(QMessageBox, "setInformativeText", lambda self, t: O["QMessageBox.setInformativeText"](self, tr(t)))
+
+    def _mb_add_button(self, *a):
+        a = list(a)
+        if a and isinstance(a[0], str):
+            a[0] = tr(a[0])
+        return O["QMessageBox.addButton"](self, *a)
+    wrap(QMessageBox, "addButton", _mb_add_button)
+
+    # QInputDialog: a választott elem EREDETI (magyar) szövegét adjuk vissza, mert a program ehhez hasonlít
+    gi, gt = QInputDialog.getItem, QInputDialog.getText
+    O["QInputDialog.getItem"], O["QInputDialog.getText"] = gi, gt
+
+    def _get_item(parent, title, label, items, *a, **k):
+        items = list(items)
+        tx = [tr(x) for x in items]
+        res, ok = gi(parent, tr(title), tr(label), tx, *a, **k)
+        return (items[tx.index(res)] if res in tx else res), ok
+    QInputDialog.getItem = staticmethod(_get_item)
+    QInputDialog.getText = staticmethod(lambda parent, title, label, *a, **k: gt(parent, tr(title), tr(label), *a, **k))
+    for nm in ("getOpenFileName", "getSaveFileName", "getOpenFileNames"):
+        f0 = getattr(_QFD, nm)
+        O[f"QFileDialog.{nm}"] = f0
+
+        def mk2(f0):
+            def fn(parent=None, caption="", directory="", filter="", *a, **k):
+                return f0(parent, tr(caption), directory, tr(filter), *a, **k)
+            return staticmethod(fn)
+        setattr(_QFD, nm, mk2(f0))
+    gd = _QFD.getExistingDirectory
+    O["QFileDialog.getExistingDirectory"] = gd
+    _QFD.getExistingDirectory = staticmethod(lambda parent=None, caption="", *a, **k: gd(parent, tr(caption), *a, **k))
 
 
 class TooltipFilter(QObject):
@@ -2502,7 +2680,7 @@ class TimelineCanvas(QWidget):
         pk = P.engine_peaks(c)
         if pk is None:
             p.setPen(QColor(255, 255, 255, 90))
-            p.drawText(r, Qt.AlignCenter, "betöltés…")
+            p.drawText(r, Qt.AlignCenter, tr("betöltés…"))
             return
         W = self.width()
         x_a = max(0, int(r.left()))
@@ -7165,7 +7343,7 @@ class MainWindow(QMainWindow):
                    "form": {**f, "seed": seed, "random_seed": False, "batch": 1}}
             row = self.tbl_queue.rowCount()
             self.tbl_queue.insertRow(row)
-            vals = [str(jid), title or f["style"][:70], str(seed), "várakozik", ""]
+            vals = [str(jid), title or f["style"][:70], str(seed), tr("várakozik"), ""]
             for c, v in enumerate(vals):
                 self.tbl_queue.setItem(row, c, QTableWidgetItem(v))
             self.job_rows[jid] = row
@@ -7188,7 +7366,7 @@ class MainWindow(QMainWindow):
 
     def _job_started(self, jid: int):
         self.job_t0[jid] = time.time()
-        self._set_job_cell(jid, 3, "▶ fut…", "#facc15")
+        self._set_job_cell(jid, 3, tr("▶ fut…"), "#facc15")
 
     def _tick_elapsed(self):
         for jid, t0 in list(self.job_t0.items()):
@@ -7203,7 +7381,7 @@ class MainWindow(QMainWindow):
     def _job_finished(self, jid: int, info: dict):
         self.job_t0.pop(jid, None)
         self.job_track[jid] = info["track_id"]
-        self._set_job_cell(jid, 3, "✓ kész", "#4ade80")
+        self._set_job_cell(jid, 3, tr("✓ kész"), "#4ade80")
         self.current_track = self.db.get(info["track_id"])
         self.last_abc = info.get("abc", "")
         self.lbl_last.setText(f"<b>{Path(info['wav']).name}</b><br>{info['dur']:.0f} mp hang, "
@@ -7221,7 +7399,7 @@ class MainWindow(QMainWindow):
             self.remake.jobs.discard(jid)
             self.remake.say(f"HIBA egy változatnál: {msg}")
         self.job_t0.pop(jid, None)
-        self._set_job_cell(jid, 3, "✗ hiba", "#f87171")
+        self._set_job_cell(jid, 3, tr("✗ hiba"), "#f87171")
         row = self.job_rows.get(jid)
         if row is not None and self.tbl_queue.item(row, 3):
             self.tbl_queue.item(row, 3).setToolTip(msg)
@@ -7244,16 +7422,16 @@ class MainWindow(QMainWindow):
             if it:
                 jid = int(it.text())
                 self.worker.remove(jid)
-                if self.tbl_queue.item(row, 3).text() == "várakozik":
-                    self._set_job_cell(jid, 3, "törölve", "#80828e")
+                if self.tbl_queue.item(row, 3).text() == tr("várakozik"):
+                    self._set_job_cell(jid, 3, tr("törölve"), "#80828e")
         self._update_queue_label()
 
     def _clear_pending(self):
         self.worker.clear_pending()
         for jid, row in self.job_rows.items():
             it = self.tbl_queue.item(row, 3)
-            if it and it.text() == "várakozik":
-                it.setText("törölve")
+            if it and it.text() == tr("várakozik"):
+                it.setText(tr("törölve"))
                 it.setForeground(QColor("#80828e"))
         self._update_queue_label()
 
@@ -8234,6 +8412,17 @@ class MainWindow(QMainWindow):
         self.chk_mp3 = QCheckBox("Minden generálás után MP3 is (ffmpeg)")
         self.chk_mp3.setChecked(bool(self.cfg.get("auto_mp3")))
         f.addRow("", self.chk_mp3)
+        self.cb_ui_lang = QComboBox()
+        for code, name in UI_LANGS:
+            self.cb_ui_lang.addItem(name, code)
+        i_ = self.cb_ui_lang.findData(self.cfg.get("ui_lang", "hu"))
+        self.cb_ui_lang.setCurrentIndex(max(0, i_))
+        self.cb_ui_lang.setToolTip(tip_html("Felület nyelve|A program feliratainak, súgó buborékainak, üzeneteinek, a "
+                                            "Súgó fülnek és a Kalauznak a nyelve. Az új nyelv a program "
+                                            "újraindítása után lép életbe.\nA fordítások a 'lang' mappában vannak, "
+                                            "szövegszerkesztővel javíthatók."))
+        self.cb_ui_lang.activated.connect(self._ui_lang_changed)
+        f.addRow("Felület nyelve:", self.cb_ui_lang)
         self.chk_tips = QCheckBox("Súgó buborékok megjelenítése (egérmutató az elem fölött)")
         self.chk_tips.setChecked(bool(self.cfg.get("show_tooltips", True)))
         self.chk_tips.toggled.connect(self._tips_toggled)
@@ -8289,6 +8478,25 @@ class MainWindow(QMainWindow):
         self.cb_oll_model.setCurrentText(cur if cur in ms or not ms else ms[0])
         if not ms:
             QMessageBox.information(self, "Ollama", "Nem érhető el az Ollama, vagy nincs modell.")
+
+    def _ui_lang_changed(self, *_):
+        code = self.cb_ui_lang.currentData()
+        if code == self.cfg.get("ui_lang", "hu"):
+            return
+        if code != "hu" and not (LANG_DIR / f"{code}.json").is_file():
+            QMessageBox.warning(self, "Felület nyelve", f"Hiányzik a nyelvi fájl: lang/{code}.json")
+            self.cb_ui_lang.setCurrentIndex(max(0, self.cb_ui_lang.findData(self.cfg.get("ui_lang", "hu"))))
+            return
+        self.cfg["ui_lang"] = code
+        save_settings(self.cfg)
+        if QMessageBox.question(self, "Felület nyelve", "Az új nyelv újraindítás után lép életbe. "
+                                "Újraindítsam most a programot? (A munkád megmarad.)") == QMessageBox.Yes:
+            self._restart_app()
+
+    def _restart_app(self):
+        self._restarting = True
+        QProcess.startDetached(sys.executable, [str(Path(__file__).resolve())] + sys.argv[1:])
+        self.close()
 
     def _save_settings_ui(self):
         for k, ed in self.set_widgets.items():
@@ -8907,6 +9115,17 @@ kiemelt elemre figyelj (rá is kattinthatsz). Lépés: Következő / → ; kilé
 """
 
 
+def _translate_after_init(*classes):
+    """A később létrejövő ablakrészek (Kalauz, sávfejléc, párbeszédek) feliratait is lefordítjuk."""
+    for cls in classes:
+        orig = cls.__init__
+
+        def init(self, *a, __orig=orig, **k):
+            __orig(self, *a, **k)
+            translate_tree(self)
+        cls.__init__ = init
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
@@ -8914,8 +9133,17 @@ def main():
     app.setStyleSheet(DARK_QSS)
     global TOOLTIP_FILTER
     TOOLTIP_FILTER = TooltipFilter()
+    lang = load_settings().get("ui_lang", "hu")
+    if lang != "hu":
+        if load_language(lang):
+            install_translation_hooks()
+            _translate_after_init(TourOverlay, TrackHeader, FxDialog, ClipDialog)
+        else:
+            QMessageBox.warning(None, APP_NAME, f"A(z) '{lang}' nyelvi fájl hiányzik vagy hibás (lang mappa). "
+                                                "A program magyarul indul.")
     try:
         w = MainWindow()
+        translate_tree(w)
     except Exception:
         QMessageBox.critical(None, APP_NAME, traceback.format_exc())
         raise

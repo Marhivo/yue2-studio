@@ -18,7 +18,8 @@ videókártyádon fut, az [audio.cpp](https://github.com/audio-cpp/audio.cpp) sz
 | ⚙ **Telepítés & Szerver** | A motor és a modellek letöltése, a szerver indítása és naplója |
 
 További szolgáltatások:
-- Minden elemen magyar **súgó buborék**.
+- Minden elemen **súgó buborék**.
+- **Többnyelvű felület** (Beállítások → *Felület nyelve*): magyar, English, Deutsch, Français, Romani (lovári). A súgók, a Súgó fül és a Kalauz is lefordult. A fordítások a `lang/` mappában vannak, sima JSON fájlokban, bárki javíthatja őket. A romani fordítás gépi, ezért anyanyelvi átnézést kér. A PDF kézikönyv magyar.
 - A **🧭 Kalauz** lépésenkénti bemutatókkal vezet végig a programon.
 - **Projektek**: az összes fül tartalma egy fájlba menthető és visszatölthető. A Könyvtár csak az aktuális projekt dalait mutatja.
 - **🧹 Tiszta lap** gomb minden munkafülön. Kilépéskor semmi sem vész el.
