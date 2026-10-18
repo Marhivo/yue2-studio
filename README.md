@@ -20,6 +20,8 @@ videókártyádon fut, az [audio.cpp](https://github.com/audio-cpp/audio.cpp) sz
 További szolgáltatások:
 - Minden elemen magyar **súgó buborék**.
 - A **🧭 Kalauz** lépésenkénti bemutatókkal vezet végig a programon.
+- **Projektek**: az összes fül tartalma egy fájlba menthető és visszatölthető. A Könyvtár csak az aktuális projekt dalait mutatja.
+- **🧹 Tiszta lap** gomb minden munkafülön. Kilépéskor semmi sem vész el.
 - Globális **lejátszósáv** az ablak alján.
 - Helyi **Ollama** segéd a dalszöveg és a stílus-tagek írásához.
 

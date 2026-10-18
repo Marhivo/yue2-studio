@@ -22,6 +22,7 @@ Opcionális: ffmpeg a PATH-on (MP3 export, nem-WAV referencia hang)
 from __future__ import annotations
 
 import base64
+from html import escape as html_escape
 import datetime as dt
 import hashlib
 import json
@@ -48,7 +49,7 @@ from PySide6.QtWidgets import (
     QLayout, QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter,
-    QTabWidget, QTableWidget, QTableWidgetItem, QTextBrowser, QToolButton, QVBoxLayout, QWidget,
+    QTabWidget, QTableWidget, QTableWidgetItem, QTextBrowser, QToolButton, QVBoxLayout, QWidget, QRadioButton,
 )
 
 try:
@@ -58,7 +59,7 @@ except Exception:  # pragma: no cover
     HAS_MULTIMEDIA = False
 
 APP_NAME = "YuE2 Studio"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 IS_WINDOWS = sys.platform == "win32"
 NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 
@@ -69,6 +70,9 @@ APP_DIR = Path(__file__).resolve().parent
 SETTINGS_FILE = APP_DIR / "yue2_studio_beallitasok.json"
 DB_FILE = APP_DIR / "yue2_studio.db"
 PRESET_DIR = APP_DIR / "presetek"
+PROJECT_DIR = APP_DIR / "projektek"
+SESSION_FILE = PROJECT_DIR / "_munkamenet.y2proj"
+DEFAULT_PROJECT = "Névtelen projekt"
 
 DEFAULT_SETTINGS = {
     "engine_dir": str(APP_DIR / "motor"),
@@ -354,6 +358,9 @@ class TrackDB:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, title TEXT, style TEXT, lyrics TEXT,
                 seed INTEGER, cot TEXT, model TEXT, params TEXT, wav_path TEXT, abc_path TEXT,
                 duration REAL, gen_secs REAL, fav INTEGER DEFAULT 0, note TEXT DEFAULT '')""")
+            cols = [r[1] for r in c.execute("PRAGMA table_info(tracks)")]
+            if "project" not in cols:
+                c.execute("ALTER TABLE tracks ADD COLUMN project TEXT DEFAULT ''")
 
     def _conn(self):
         return sqlite3.connect(self.path, timeout=10)
@@ -365,9 +372,13 @@ class TrackDB:
             cur = c.execute(f"INSERT INTO tracks({cols}) VALUES({q})", list(kw.values()))
             return cur.lastrowid
 
-    def all(self, search: str = "", fav_only: bool = False) -> list[dict]:
+    def all(self, search: str = "", fav_only: bool = False, project: str | None = None) -> list[dict]:
+        """project=None: minden dal; különben csak az adott projekt dalai ('' = projekt nélküliek)."""
         sql = "SELECT * FROM tracks WHERE 1=1"
         args: list = []
+        if project is not None:
+            sql += " AND COALESCE(project,'')=?"
+            args.append(project)
         if search:
             sql += " AND (title LIKE ? OR style LIKE ? OR lyrics LIKE ? OR note LIKE ?)"
             args += [f"%{search}%"] * 4
@@ -392,6 +403,20 @@ class TrackDB:
     def delete(self, tid: int) -> None:
         with self.lock, self._conn() as c:
             c.execute("DELETE FROM tracks WHERE id=?", (tid,))
+
+    def projects(self) -> list[str]:
+        with self.lock, self._conn() as c:
+            return [r[0] for r in c.execute("SELECT DISTINCT COALESCE(project,'') FROM tracks ORDER BY 1")]
+
+    def retag(self, old: str, new: str) -> None:
+        with self.lock, self._conn() as c:
+            c.execute("UPDATE tracks SET project=? WHERE COALESCE(project,'')=?", (new, old))
+
+    def by_wav(self, wav: str) -> dict | None:
+        with self.lock, self._conn() as c:
+            c.row_factory = sqlite3.Row
+            r = c.execute("SELECT * FROM tracks WHERE wav_path=?", (wav,)).fetchone()
+            return dict(r) if r else None
 
 
 # ---------------------------------------------------------------------------
@@ -747,7 +772,7 @@ class GenWorker(QThread):
                           style=job["options"].get("style", ""), lyrics=job["lyrics"], seed=int(job["seed"]),
                           cot=job["options"].get("cot", ""), model=job["session"].get("yue2.model_gguf", ""),
                           params=json.dumps(params, ensure_ascii=False), wav_path=str(wav), abc_path=abc_path,
-                          duration=dur, gen_secs=secs)
+                          duration=dur, gen_secs=secs, project=job.get("project", ""))
         self.log.emit(f"✓ Kész: {wav.name}  ({dur:.0f} mp hang, {secs:.0f} mp alatt)")
         return {"track_id": tid, "wav": str(wav), "abc": abc_text, "secs": secs, "dur": dur}
 
@@ -1086,6 +1111,9 @@ QPushButton:disabled { color: #5d5f6b; border-color: #2a2c36; }
 QPushButton#primary { background: #6a4dff; border-color: #8a72ff; font-weight: 700; padding: 9px 16px; }
 QPushButton#primary:hover { background: #7c62ff; }
 QPushButton#danger { background: #4a2228; border-color: #7a3540; }
+QPushButton#clear { background: #3a2f1a; border-color: #8a6a2a; color: #fcd68a; }
+QPushButton#clear:hover { background: #4a3b1f; }
+QWidget#projbar { border-bottom: 1px solid #2c2e37; }
 QPushButton#tag { padding: 3px 8px; border-radius: 10px; background: #22242d; font-size: 9pt; }
 QPushButton#tag:hover { background: #3a2f6e; }
 QToolButton#collapse { border: none; color: #b9a8ff; font-weight: 600; padding: 4px; background: transparent; }
@@ -1419,6 +1447,16 @@ SEM_MAX_EXTRA = " A semantic max tokens a szám maximális hosszát is megszabja
 
 ARENA_TIP = ("Szakértői beállítás: a GPU memóriaterület mérete ehhez a részhez (MB). Csak akkor módosítsd, "
              "ha a naplóban memória (arena / allocation) hiba jelenik meg. Kikapcsolva az alapérték él.")
+
+
+def clear_button(fn, what: str) -> QPushButton:
+    """Egységes „🧹 Tiszta lap” gomb minden fülre."""
+    b = QPushButton("🧹 Tiszta lap")
+    b.setObjectName("clear")
+    b.setToolTip(tip_html("Tiszta lap|" + what + "\nElőtte rákérdez. Ha a munkát meg akarod tartani, előbb mentsd "
+                          "a projektet (fent: 💾 Mentés)."))
+    b.clicked.connect(fn)
+    return b
 
 
 def tip_html(text: str) -> str:
@@ -2980,10 +3018,13 @@ class DawPanel(QWidget):
             lay.addWidget(b)
             self.btn[key] = b
             return b
-        btn("new", "Új", self.new_project, "Új projekt|Üres projekt kezdése (a jelenlegit előtte mentsd el).")
-        btn("open", "Megnyitás…", self.open_project, "Projekt megnyitása|Korábban mentett .y2daw projekt betöltése.")
-        btn("save", "Mentés", self.save_project, "Mentés|A projekt mentése. Első alkalommal rákérdez a névre.")
-        btn("saveas", "Mentés másként…", lambda: self.save_project(True), "Mentés másként|Mentés új néven.")
+        btn("new", "🧹 Tiszta lap", self.new_project, "Tiszta lap|Minden sáv és klip eltávolítása a DAW-ból (a "
+            "hangfájlok megmaradnak a lemezen). Ctrl+Z-vel visszahozható.")
+        btn("open", "DAW-fájl…", self.open_project, "DAW-fájl megnyitása|Csak a sávszerkesztő tartalmát tölti be egy "
+            ".y2daw fájlból. A teljes munkát (minden fül) a felső Projekt sávval mentsd és nyisd meg.")
+        btn("save", "DAW-fájl mentése", self.save_project, "DAW-fájl mentése|Csak a sávszerkesztő tartalmát menti "
+            ".y2daw fájlba. A teljes munkát (minden fül) a felső Projekt sáv 💾 gombja menti.")
+        btn("saveas", "…másként", lambda: self.save_project(True), "DAW-fájl mentése másként|Csak a sávok, új néven.")
         r1.addSpacing(12)
         btn("import", "＋ Hangfájl…", self.import_files,
             "Hangfájl importálása|WAV, MP3, FLAC, OGG fájl(ok) betöltése új sáv(ok)ra, a lejátszófej helyére.")
@@ -3122,7 +3163,7 @@ class DawPanel(QWidget):
         self.lbl_status.setToolTip(tip_html("Állapot|Mi történik épp: számolás (effektek, tempó), kijelölt klip "
                                             "adatai, sávbontás és MIDI állapota."))
         v.addWidget(self.lbl_status)
-        for seq, fn in (("Ctrl+Z", self.undo), ("Ctrl+Y", self.redo), ("Ctrl+Shift+Z", self.redo), ("Ctrl+S", self.save_project)):
+        for seq, fn in (("Ctrl+Z", self.undo), ("Ctrl+Y", self.redo), ("Ctrl+Shift+Z", self.redo)):
             sc = QShortcut(QKeySequence(seq), self)
             sc.setContext(Qt.WidgetWithChildrenShortcut)
             sc.activated.connect(fn)
@@ -3782,9 +3823,9 @@ class DawPanel(QWidget):
         self.autosave()
 
     # ---------------------------------------------------------- projekt fájl
-    def new_project(self):
-        if self.project["tracks"] and QMessageBox.question(self, "Új projekt", "Új projektet kezdesz? (A mostani "
-                                                           "visszavonással visszahozható.)") != QMessageBox.Yes:
+    def new_project(self, ask: bool = True):
+        if ask and self.project["tracks"] and QMessageBox.question(
+                self, "Tiszta lap", "Kiürítsem a sávszerkesztőt? (Ctrl+Z-vel visszahozható.)") != QMessageBox.Yes:
             return
         self.record()
         self.engine.pause()
@@ -3876,7 +3917,8 @@ class DawPanel(QWidget):
                              title=f"{self.project.get('name', 'Keverés')} (DAW keverés)", style="DAW keverés",
                              lyrics="", seed=0, cot="", model="DAW",
                              params=json.dumps({"daw_project": self.project}, ensure_ascii=False),
-                             wav_path=f, abc_path="", duration=dur, gen_secs=0)
+                             wav_path=f, abc_path="", duration=dur, gen_secs=0,
+                             project=getattr(self.main, "project_name", ""))
             self.main.refresh_library()
         self.status(f"Exportálva: {f}")
 
@@ -4419,6 +4461,9 @@ class ScorePanel(QWidget):
         left.setFixedWidth(360)
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
+        self.btn_clear = clear_button(lambda: self.clear(ask=True), "A Kotta fül kiürítése: forrás, cím, szerző, "
+                                      "beállítások. A mentett PDF-ek és fájlok megmaradnak.")
+        lv.addWidget(self.btn_clear, 0, Qt.AlignRight)
         g = QGroupBox("1. Honnan jöjjön a kotta?")
         gl = QVBoxLayout(g)
         for txt, fn, tip in (
@@ -4626,6 +4671,59 @@ class ScorePanel(QWidget):
             self._render_js(abc)
         elif self.source_abc:
             self.refresh()
+
+    # ---------------------------------------------------------- projekt
+    def get_state(self) -> dict:
+        return {"kind": self.source_kind, "abc": self.source_abc, "midi": self.midi_path, "label": self.lbl_src.text(),
+                "title": self.ed_title.text(), "composer": self.ed_composer.text(),
+                "voice": self.cb_voice.currentIndex(), "chords": self.chk_chords.isChecked(),
+                "tr": self.sp_tr.value(), "scale": self.sp_scale.value(), "mode": self.cb_mode.currentIndex(),
+                "grid": self.cb_grid.currentIndex(), "key": self.cb_key.currentIndex(), "bpl": self.sp_bpl.value()}
+
+    def set_state(self, st: dict):
+        ws = (self.ed_title, self.ed_composer, self.cb_voice, self.chk_chords, self.sp_tr, self.sp_scale,
+              self.cb_mode, self.cb_grid, self.cb_key, self.sp_bpl)
+        for w_ in ws:
+            w_.blockSignals(True)
+        try:
+            self.ed_title.setText(st.get("title", ""))
+            self.ed_composer.setText(st.get("composer", ""))
+            self.cb_voice.setCurrentIndex(int(st.get("voice", 0)))
+            self.chk_chords.setChecked(bool(st.get("chords", True)))
+            self.sp_tr.setValue(int(st.get("tr", 0)))
+            self.sp_scale.setValue(float(st.get("scale", 1.0)))
+            self.cb_mode.setCurrentIndex(int(st.get("mode", 0)))
+            self.cb_grid.setCurrentIndex(int(st.get("grid", 0)))
+            self.cb_key.setCurrentIndex(int(st.get("key", 0)))
+            self.sp_bpl.setValue(int(st.get("bpl", 4)))
+        finally:
+            for w_ in ws:
+                w_.blockSignals(False)
+        self.source_kind = st.get("kind", "")
+        self.source_abc = st.get("abc", "")
+        self.midi_path = st.get("midi", "")
+        self.g_midi.setVisible(self.source_kind == "midi")
+        self.lbl_src.setText(st.get("label") or "Még nincs betöltve kotta.")
+        if self.ed_code.isVisible():
+            self.ed_code.blockSignals(True)
+            self.ed_code.setPlainText(self.current_abc())
+            self.ed_code.blockSignals(False)
+        if self.source_abc:
+            self.refresh()
+        elif self.view is not None and self._ready:
+            self.view.page().runJavaScript("document.getElementById('paper').innerHTML='';"
+                                           "document.getElementById('msg').innerText='';")
+        else:
+            self._pending = None
+
+    def has_content(self) -> bool:
+        return bool(self.source_abc)
+
+    def clear(self, ask: bool = False):
+        if ask and self.has_content() and QMessageBox.question(
+                self, "Tiszta lap", "Kiürítsem a Kotta fület?") != QMessageBox.Yes:
+            return
+        self.set_state({})
 
     # ---------------------------------------------------------- források
     def set_abc(self, abc: str, label: str, title: str = ""):
@@ -4977,7 +5075,12 @@ class RemakePanel(QWidget):
         intro.setObjectName("dim")
         intro.setToolTip(tip_html("Átdolgozás|Meglévő dal újrakészítése új stílusban. A Kalauz (jobb alul) "
                                   "végigvezet a lépéseken."))
-        fl.addWidget(intro)
+        r0 = QHBoxLayout()
+        r0.addWidget(intro, 1)
+        self.btn_clear = clear_button(lambda: self.clear(ask=True), "Az Átdolgozás fül minden mezőjét kiüríti: dal, "
+                                      "dallam, szöveg, stílusok, eredménylista, napló. A kész dalok a Könyvtárban maradnak.")
+        r0.addWidget(self.btn_clear, 0, Qt.AlignTop)
+        fl.addLayout(r0)
 
         # 1. dal
         g1 = QGroupBox("1. A dal")
@@ -5537,6 +5640,81 @@ class RemakePanel(QWidget):
         if t:
             self.main._play_track(t)
 
+    # ---------------------------------------------------------- projekt
+    def has_content(self) -> bool:
+        return bool(self.src or self.ed_abc.toPlainText().strip() or self.ed_lyrics.toPlainText().strip()
+                    or self.lst.count())
+
+    def clear(self, ask: bool = False):
+        if ask and self.has_content() and QMessageBox.question(
+                self, "Tiszta lap", "Kiürítsem az Átdolgozás fület? (A kész dalok a Könyvtárban maradnak.)") != QMessageBox.Yes:
+            return
+        self.set_state({})
+
+    def get_state(self) -> dict:
+        return {"src": self.src, "part": self.chk_part.isChecked(), "from": self.sp_from.value(),
+                "to": self.sp_to.value(), "vocals": self.vocals, "abc": self.ed_abc.toPlainText(),
+                "lang": self.cb_lang.currentIndex(), "lyrics": self.ed_lyrics.toPlainText(),
+                "instr": self.chk_instr.isChecked(),
+                "styles": [n for n, cb in self.style_checks.items() if cb.isChecked()],
+                "voice": self.cb_voice.currentIndex(), "lang_tag": self.cb_lang_tag.currentIndex(),
+                "custom": self.ed_style.text(), "n": self.sp_n.value(), "cot": self.cb_cot.currentIndex(),
+                "title": self.ed_title.text(),
+                "results": [int(self.lst.item(i).data(Qt.UserRole)) for i in range(self.lst.count())]}
+
+    def set_state(self, st: dict):
+        self.auto_chain = False
+        self.jobs.clear()
+        self.src = st.get("src", "")
+        self.work_src = ""
+        self.ed_file.setText(self.src)
+        for w_ in (self.chk_part, self.sp_from, self.sp_to):
+            w_.blockSignals(True)
+        self.chk_part.setChecked(bool(st.get("part")))
+        self.sp_from.setValue(float(st.get("from", 0)))
+        self.sp_to.setValue(float(st.get("to", 90)))
+        self.sp_from.setEnabled(self.chk_part.isChecked())
+        self.sp_to.setEnabled(self.chk_part.isChecked())
+        for w_ in (self.chk_part, self.sp_from, self.sp_to):
+            w_.blockSignals(False)
+        self.lbl_info.setText("")
+        for i in range(6):
+            self.step(i, "todo")
+        if self.src and Path(self.src).is_file():
+            self._prepare_source()
+        self.vocals = st.get("vocals", "") if Path(st.get("vocals") or "").is_file() else ""
+        self.btn_play_voc.setEnabled(bool(self.vocals))
+        self.lbl_sep.setText("Kész (betöltve)" if self.vocals else "")
+        if self.vocals:
+            self.step(1, "ok")
+        self.ed_abc.setPlainText(st.get("abc", ""))
+        if st.get("abc"):
+            self.step(2, "ok")
+        self.cb_lang.setCurrentIndex(int(st.get("lang", 0)))
+        self.ed_lyrics.setPlainText(st.get("lyrics", ""))
+        if st.get("lyrics"):
+            self.step(3, "ok")
+        self.chk_instr.setChecked(bool(st.get("instr")))
+        for n, cb in self.style_checks.items():
+            cb.setChecked(n in (st.get("styles") or []))
+        self.cb_voice.setCurrentIndex(int(st.get("voice", 0)))
+        self.cb_lang_tag.setCurrentIndex(int(st.get("lang_tag", 0)))
+        self.ed_style.setText(st.get("custom", ""))
+        self.sp_n.setValue(int(st.get("n", 2)))
+        self.cb_cot.setCurrentIndex(int(st.get("cot", 0)))
+        self.ed_title.setText(st.get("title", ""))
+        self.lst.clear()
+        for tid in st.get("results") or []:
+            t = self.main.db.get(int(tid))
+            if t:
+                it = QListWidgetItem(f"♪ {t.get('title')}   ({(t.get('duration') or 0):.0f} mp)")
+                it.setData(Qt.UserRole, int(tid))
+                self.lst.addItem(it)
+        if self.lst.count():
+            self.step(4, "ok")
+            self.step(5, "ok")
+        self.log.clear()
+
 
 class TourOverlay(QWidget):
     def __init__(self, main, steps: list[dict], title: str):
@@ -5870,6 +6048,25 @@ def build_tours(m) -> dict:
             {"title": "Hol tartunk?", "target": lambda: R.step_lbls,
              "text": "Itt követed a lépéseket: ○ még nincs kész · ⏳ folyamatban · ✓ kész · – kihagyva."},
         ])
+    tours["project"] = ("Projektek és tiszta lap", [
+        {"title": "A projekt sáv", "target": lambda: m.lbl_proj.parentWidget(),
+         "text": "Fent mindig látod, melyik <b>projekten</b> dolgozol. Egy projekt = minden fül tartalma (Generálás, "
+                 "Átdolgozás, ABC-kotta, DAW, Kotta) + a hozzá generált dalok. A sárga <b>●</b> jel: van még nem "
+                 "mentett változás."},
+        {"title": "Új, Megnyitás, Mentés", "target": lambda: m.lbl_proj.parentWidget(),
+         "text": "<b>🆕 Új projekt</b> (Ctrl+N): minden fül kiürül, új nevet adsz. <b>💾 Mentés</b> (Ctrl+S): "
+                 "minden egy fájlba kerül. <b>📂 Megnyitás</b> (Ctrl+O) vagy <b>Legutóbbiak</b>: pontosan "
+                 "visszaáll, ahogy hagytad."},
+        {"title": "🧹 Tiszta lap", "target": lambda: m.btn_clear_gen, "before": tab(gen),
+         "text": "Minden munkafülön van egy ilyen gomb: csak <b>azt az egy fület</b> üríti ki. A kész dalok a "
+                 "Könyvtárban maradnak."},
+        {"title": "A Könyvtár szűrője", "target": lambda: m.cb_lib_proj, "before": tab(lib),
+         "text": "A Könyvtár alapból <b>csak az aktuális projekt</b> dalait mutatja - így nem keverednek. A régi "
+                 "projektek dalait itt választhatod ki, vagy a <b>Minden dal</b> pontot."},
+        {"title": "Könyvtár ürítése", "target": lambda: m.btn_clear_lib,
+         "text": "Ha tényleg törölni szeretnél: választhatsz, hogy melyik dalokat (projekt / látható / mind), és "
+                 "hogy csak a listából vagy a lemezről is. A kedvencek alapból megmaradnak."},
+    ])
     return tours
 
 
@@ -5890,6 +6087,12 @@ class MainWindow(QMainWindow):
         self.cfg = load_settings()
         self.db = TrackDB(DB_FILE)
         PRESET_DIR.mkdir(exist_ok=True)
+        PROJECT_DIR.mkdir(exist_ok=True)
+        self.project_name = self.cfg.get("project_name") or DEFAULT_PROJECT
+        self.project_file: Path | None = Path(self.cfg["project_file"]) if self.cfg.get("project_file") else None
+        if self.project_file is not None and not self.project_file.is_file():
+            self.project_file = None
+        self._proj_clean = ""
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION} - helyi YuE2 zenegenerátor")
         self.resize(1500, 950)
 
@@ -5961,6 +6164,7 @@ class MainWindow(QMainWindow):
         cl = QVBoxLayout(central)
         cl.setContentsMargins(0, 0, 0, 0)
         cl.setSpacing(4)
+        cl.addWidget(self._build_project_bar())
         cl.addWidget(tabs, 1)
         cl.addWidget(self._build_player_bar())
         self.setCentralWidget(central)
@@ -5986,7 +6190,6 @@ class MainWindow(QMainWindow):
         self.elapsed_timer.start(1000)
 
         self.refresh_install_state()
-        self.refresh_library()
         self._refresh_presets()
         if self.cfg.get("last_form"):
             try:
@@ -5996,7 +6199,16 @@ class MainWindow(QMainWindow):
         else:
             self.ed_lyrics.setPlainText(LYRICS_EXAMPLE)
             self.ed_style.setText(STYLE_EXAMPLE)
+        self._restore_session()
         self._apply_tooltips()
+        self.proj_timer = QTimer(self)
+        self.proj_timer.timeout.connect(self._update_project_label)
+        self.proj_timer.start(1500)
+        for seq, fn in (("Ctrl+S", self.save_project), ("Ctrl+Shift+S", lambda: self.save_project(True)),
+                        ("Ctrl+O", self.open_project), ("Ctrl+N", self.new_project)):
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.setContext(Qt.ApplicationShortcut)
+            sc.activated.connect(fn)
         QTimer.singleShot(1800, self._maybe_autostart)
         QTimer.singleShot(3500, self._offer_tour)
 
@@ -6015,6 +6227,16 @@ class MainWindow(QMainWindow):
         # ---------- bal oldal: űrlap (görgethető)
         form_w = QWidget()
         fl = QVBoxLayout(form_w)
+
+        r0 = QHBoxLayout()
+        r0.addStretch()
+        self.btn_clear_gen = clear_button(lambda: self.clear_generate(ask=True),
+                                          "A Generálás fül kiürítése: dalszöveg, stílus, cím, haladó paraméterek "
+                                          "(alapértékre), LoRA-k, a kész feladatok sorai, az utolsó eredmény és a "
+                                          "napló. A választott fő modell és VAE megmarad, a kész dalok a Könyvtárban "
+                                          "maradnak, a várakozó feladatok nem törlődnek.")
+        r0.addWidget(self.btn_clear_gen)
+        fl.addLayout(r0)
 
         # Dalszöveg
         g_ly = QGroupBox("Dalszöveg")
@@ -6565,7 +6787,7 @@ class MainWindow(QMainWindow):
             title = f["title"].strip()
             if title and f["batch"] > 1:
                 title = f"{title} ({i + 1})"
-            job = {"id": jid, "kind": "gen", "lyrics": f["lyrics"].strip(), "options": dict(opts),
+            job = {"id": jid, "kind": "gen", "project": self.project_name, "lyrics": f["lyrics"].strip(), "options": dict(opts),
                    "session": dict(sess), "seed": seed, "title": title,
                    "form": {**f, "seed": seed, "random_seed": False, "batch": 1}}
             row = self.tbl_queue.rowCount()
@@ -6747,12 +6969,15 @@ class MainWindow(QMainWindow):
         for txt, fn in [("Megnyitás…", self._abc_open), ("Mentés…", self._abc_save),
                         ("Utolsó generált terv", self._last_abc_to_editor), ("Hosszabbítás ×2", lambda: self._abc_ext(2)),
                         ("Hosszabbítás ×3", lambda: self._abc_ext(3)), ("Ének szólam törlése", self._abc_mute),
-                        ("🎼 Kottaként", self._abc_to_score),
-                        ("Törlés", lambda: self.ed_abc.clear())]:
+                        ("🎼 Kottaként", self._abc_to_score)]:
             b = QPushButton(txt)
             b.clicked.connect(fn)
             r.addWidget(b)
         r.addStretch()
+        self.btn_clear_abc = clear_button(lambda: self.clear_abc(ask=True), "Az ABC-kotta fül kiürítése: a zenei terv "
+                                          "és a kinyeréshez megadott hangfájl. A Generálás fülön a 'terv használata' "
+                                          "pipa is kikapcsol.")
+        r.addWidget(self.btn_clear_abc)
         l.addLayout(r)
         self.ed_abc = QPlainTextEdit()
         self.ed_abc.setPlaceholderText("X:1\nT:Cím\nM:4/4\nL:1/8\nQ:1/4=120\nK:Am\nV: Vocal\n\"Am\" A2 c2 e2 c2 | …")
@@ -6835,6 +7060,16 @@ class MainWindow(QMainWindow):
         self.chk_fav = QCheckBox("csak kedvencek")
         self.chk_fav.toggled.connect(self.refresh_library)
         r.addWidget(self.chk_fav)
+        self.cb_lib_proj = QComboBox()
+        self.cb_lib_proj.setMinimumWidth(220)
+        self.cb_lib_proj.currentIndexChanged.connect(self.refresh_library)
+        lb_ = QLabel("Projekt:")
+        lb_.setToolTip(tip_html("Projekt szűrő|Melyik projekt dalait mutassa a lista."))
+        r.addWidget(lb_)
+        r.addWidget(self.cb_lib_proj)
+        self.btn_clear_lib = clear_button(self.clear_library, "")
+        self.btn_clear_lib.setText("🧹 Könyvtár ürítése…")
+        r.addWidget(self.btn_clear_lib)
         l.addLayout(r)
         self.tbl_lib = QTableWidget(0, 9)
         self.tbl_lib.setHorizontalHeaderLabels(["★", "Dátum", "Cím", "Stílus", "Seed", "COT", "Hossz", "Gen. idő", "Megjegyzés"])
@@ -6872,7 +7107,7 @@ class MainWindow(QMainWindow):
     def refresh_library(self):
         if not hasattr(self, "tbl_lib"):
             return
-        rows = self.db.all(self.ed_search.text().strip(), self.chk_fav.isChecked())
+        rows = self.db.all(self.ed_search.text().strip(), self.chk_fav.isChecked(), self._lib_project_filter())
         self.lib_ids = [t["id"] for t in rows]
         self.tbl_lib.setRowCount(0)
         for t in rows:
@@ -7797,7 +8032,8 @@ class MainWindow(QMainWindow):
         for key, txt, tip in (("first", "Az első dal", "Az alapok: szöveg, stílus, generálás, meghallgatás."),
                               ("daw", "DAW – sávok", "Sávokra bontás, klipek, effektek, export."),
                               ("score", "Kotta", "Kotta megjelenítése, nyomtatás, PDF."),
-                              ("remake", "Dal átdolgozása", "Egy meglévő dal dallamából új stílusú dal.")):
+                              ("remake", "Dal átdolgozása", "Egy meglévő dal dallamából új stílusú dal."),
+                              ("project", "Projektek", "Projekt mentése, megnyitása, tiszta lap, könyvtár szűrő.")):
             b = QPushButton("▶ " + txt)
             b.setObjectName("primary")
             b.setToolTip(tip_html(f"{txt}|{tip}"))
@@ -7810,10 +8046,371 @@ class MainWindow(QMainWindow):
         v.addWidget(tb, 1)
         return w
 
+    # ============================================================ PROJEKT
+    def _build_project_bar(self) -> QWidget:
+        bar = QWidget()
+        bar.setObjectName("projbar")
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(8, 4, 8, 0)
+        self.lbl_proj = QLabel("")
+        self.lbl_proj.setTextFormat(Qt.RichText)
+        self.lbl_proj.setToolTip(tip_html("Projekt|Az éppen nyitott projekt neve. Egy projekt = az összes fül "
+                                          "tartalma (Generálás, Átdolgozás, ABC-kotta, DAW, Kotta) és a hozzá "
+                                          "generált dalok. A ● jel: van még nem mentett változás."))
+        h.addWidget(self.lbl_proj)
+        h.addStretch()
+        for txt, fn, tip in (
+            ("🆕 Új projekt", self.new_project, "Új projekt (Ctrl+N)|Minden fület kiürít, és új nevű projektet "
+             "kezd. A Könyvtár ezután az új projekt dalait mutatja - a régiek nem vesznek el, a Projekt választóval "
+             "visszanézhetők."),
+            ("📂 Megnyitás…", self.open_project, "Projekt megnyitása (Ctrl+O)|Egy mentett projekt (.y2proj) "
+             "visszatöltése: minden fül pontosan úgy áll vissza, ahogy mentetted."),
+            ("💾 Mentés", self.save_project, "Projekt mentése (Ctrl+S)|Az összes fül tartalma egyetlen .y2proj fájlba. "
+             "Első alkalommal rákérdez a névre."),
+            ("Mentés másként…", lambda: self.save_project(True), "Mentés másként (Ctrl+Shift+S)|Mentés új néven / "
+             "új helyre. A projekt dalai az új névvel mennek tovább."),
+        ):
+            b = QPushButton(txt)
+            b.setToolTip(tip_html(tip))
+            b.clicked.connect(fn)
+            h.addWidget(b)
+        self.btn_recent = QPushButton("Legutóbbiak ▾")
+        self.btn_recent.setToolTip(tip_html("Legutóbbi projektek|Az utoljára mentett vagy megnyitott projektek - "
+                                            "egy kattintással megnyithatók."))
+        self.btn_recent.clicked.connect(self._recent_menu)
+        h.addWidget(self.btn_recent)
+        return bar
+
+    def _lib_project_filter(self):
+        d = self.cb_lib_proj.currentData() if hasattr(self, "cb_lib_proj") else "__cur__"
+        if d == "__cur__" or d is None:
+            return self.project_name
+        if d == "__all__":
+            return None
+        return d
+
+    def _refresh_lib_projects(self):
+        cur = self.cb_lib_proj.currentData()
+        self.cb_lib_proj.blockSignals(True)
+        self.cb_lib_proj.clear()
+        self.cb_lib_proj.addItem(f"Aktuális: {self.project_name}", "__cur__")
+        self.cb_lib_proj.addItem("Minden dal", "__all__")
+        for pn in self.db.projects():
+            if pn != self.project_name:
+                self.cb_lib_proj.addItem(pn or "(projekt nélküli régi dalok)", pn)
+        i = self.cb_lib_proj.findData(cur)
+        self.cb_lib_proj.setCurrentIndex(i if i >= 0 else 0)
+        self.cb_lib_proj.setToolTip(tip_html("Projekt szűrő|Melyik projekt dalait mutassa a lista. Alapból csak az "
+                                             "aktuális projektét - így nem keverednek a különböző munkák."))
+        self.cb_lib_proj.blockSignals(False)
+
+    def project_state(self) -> dict:
+        return {"gen": self.get_form(),
+                "abc": {"text": self.ed_abc.toPlainText(), "ref": self.ed_ref.text()},
+                "remake": self.remake.get_state() if self.remake else {},
+                "daw": self.daw.project if self.daw else {},
+                "score": self.score.get_state() if self.score else {}}
+
+    def apply_project_state(self, st: dict):
+        if st.get("gen"):
+            self.set_form(st["gen"])
+        else:
+            self.clear_generate()
+        self.ed_abc.setPlainText((st.get("abc") or {}).get("text", ""))
+        self.ed_ref.setText((st.get("abc") or {}).get("ref", ""))
+        if self.remake:
+            self.remake.set_state(st.get("remake") or {})
+        if self.daw:
+            self.daw.engine.pause()
+            self.daw.engine.seek(0)
+            self.daw.project = st["daw"] if st.get("daw") else new_project()
+            self.daw.project_path = None
+            self.daw.undo_stack.clear()
+            self.daw.redo_stack.clear()
+            self.daw.rebuild()
+            if self.daw.project.get("tracks"):
+                self.daw.zoom_fit()
+            self.daw.autosave()
+        if self.score:
+            self.score.set_state(st.get("score") or {})
+
+    def _state_key(self) -> str:
+        try:
+            return json.dumps(self.project_state(), sort_keys=True, ensure_ascii=False, default=str)
+        except Exception:
+            return ""
+
+    def _mark_clean(self):
+        self._proj_clean = self._state_key()
+        self._update_project_label()
+
+    def _project_dirty(self) -> bool:
+        return bool(self._proj_clean) and self._state_key() != self._proj_clean
+
+    def _update_project_label(self):
+        if not hasattr(self, "lbl_proj"):
+            return
+        dirty = self._project_dirty()
+        where = f" <span style='color:#80828e'>· {self.project_file.name}</span>" if self.project_file else \
+            " <span style='color:#80828e'>· még nincs mentve</span>"
+        self.lbl_proj.setText(f"📁 Projekt: <b>{html_escape(self.project_name)}</b>{where}"
+                              + ("  <span style='color:#facc15'>● nem mentett változás</span>" if dirty else ""))
+        self.setWindowTitle(f"{'● ' if dirty else ''}{self.project_name} – {APP_NAME} {APP_VERSION}")
+
+    def _ask_save_first(self, what: str) -> bool:
+        """True = mehet tovább."""
+        if not self._project_dirty():
+            return True
+        r = QMessageBox.question(self, what, f"A(z) „{self.project_name}” projektben nem mentett változások vannak."
+                                 "\n\nMented előtte?", QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
+        if r == QMessageBox.Cancel:
+            return False
+        if r == QMessageBox.Save:
+            return self.save_project()
+        return True
+
+    def _set_project(self, name: str, file: Path | None):
+        self.project_name = name
+        self.project_file = file
+        self.cfg["project_name"] = name
+        self.cfg["project_file"] = str(file) if file else ""
+        if file:
+            rec = [str(file)] + [x for x in self.cfg.get("recent_projects", []) if x != str(file)]
+            self.cfg["recent_projects"] = rec[:10]
+        save_settings(self.cfg)
+        self._refresh_lib_projects()
+        self.cb_lib_proj.setCurrentIndex(0)
+        self.refresh_library()
+
+    def new_project(self):
+        if not self._ask_save_first("Új projekt"):
+            return
+        name, ok = QInputDialog.getText(self, "Új projekt", "Az új projekt neve:",
+                                        text=f"Projekt {dt.datetime.now().strftime('%Y-%m-%d %H.%M')}")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name in self.db.projects() and QMessageBox.question(
+                self, "Új projekt", f"Már vannak dalok „{name}” néven. Hozzájuk csatlakozzon az új projekt?") != QMessageBox.Yes:
+            return
+        self.clear_all()
+        self._set_project(name, None)
+        self.log(f"Új projekt: {name}")
+        self._mark_clean()
+
+    def clear_all(self):
+        self.clear_generate()
+        self.clear_abc()
+        if self.remake:
+            self.remake.clear()
+        if self.daw:
+            self.daw.new_project(ask=False)
+        if self.score:
+            self.score.clear()
+
+    def save_project(self, save_as: bool = False) -> bool:
+        f = self.project_file
+        if f is None or save_as:
+            fn, _ = QFileDialog.getSaveFileName(self, "Projekt mentése", str(PROJECT_DIR / f"{safe_name(self.project_name, 60)}.y2proj"),
+                                                "YuE2 Studio projekt (*.y2proj)")
+            if not fn:
+                return False
+            f = Path(fn)
+            if f.suffix.lower() != ".y2proj":
+                f = f.with_suffix(".y2proj")
+        new_name = f.stem if (save_as or self.project_file is None) else self.project_name
+        if new_name != self.project_name:
+            self.db.retag(self.project_name, new_name)
+        st = self.project_state()
+        tracks = self.db.all(project=self.project_name if new_name == self.project_name else new_name)
+        data = {"app": APP_NAME, "format": 1, "name": new_name, "saved": dt.datetime.now().isoformat(timespec="seconds"),
+                **st, "tracks": tracks}
+        try:
+            tmp = f.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(tmp, f)
+        except Exception as e:
+            QMessageBox.warning(self, "Projekt mentése", f"Nem sikerült menteni:\n{e}")
+            return False
+        self._set_project(new_name, f)
+        self._mark_clean()
+        self.log(f"Projekt mentve: {f}  ({len(tracks)} dal)")
+        self.statusBar().showMessage(f"💾 Projekt mentve: {f.name}", 4000)
+        return True
+
+    def open_project(self, path: str | None = None) -> bool:
+        if not self._ask_save_first("Projekt megnyitása"):
+            return False
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, "Projekt megnyitása", str(PROJECT_DIR), "YuE2 Studio projekt (*.y2proj)")
+            if not path:
+                return False
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception as e:
+            QMessageBox.warning(self, "Projekt megnyitása", f"Nem sikerült beolvasni:\n{e}")
+            return False
+        name = data.get("name") or Path(path).stem
+        # a projekt dalai: ha valamelyik hiányzik a könyvtárból (pl. törölted a listából), visszakerül
+        back = 0
+        for t in data.get("tracks") or []:
+            wav = t.get("wav_path") or ""
+            if not wav or not Path(wav).is_file() or self.db.by_wav(wav):
+                continue
+            rec = {k: t.get(k) for k in ("created", "title", "style", "lyrics", "seed", "cot", "model", "params",
+                                         "wav_path", "abc_path", "duration", "gen_secs", "fav", "note")}
+            rec["project"] = name
+            self.db.add(**rec)
+            back += 1
+        self.apply_project_state(data)
+        self._set_project(name, Path(path))
+        self._mark_clean()
+        self.log(f"Projekt megnyitva: {path}" + (f" ({back} dal visszakerült a Könyvtárba)" if back else ""))
+        return True
+
+    def _recent_menu(self):
+        m = QMenu(self)
+        rec = [x for x in self.cfg.get("recent_projects", []) if Path(x).is_file()]
+        if not rec:
+            a = m.addAction("(még nincs mentett projekt)")
+            a.setEnabled(False)
+        for x in rec:
+            m.addAction(f"📁 {Path(x).stem}", lambda x=x: self.open_project(x))
+        m.addSeparator()
+        m.addAction("Projektek mappája…", lambda: open_in_explorer(PROJECT_DIR))
+        m.exec(self.btn_recent.mapToGlobal(QPoint(0, self.btn_recent.height())))
+
+    def _write_session(self):
+        data = {"app": APP_NAME, "format": 1, "name": self.project_name,
+                "file": str(self.project_file) if self.project_file else "", "clean": self._proj_clean,
+                **self.project_state()}
+        SESSION_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    def _restore_session(self):
+        self._refresh_lib_projects()
+        self.refresh_library()
+        if SESSION_FILE.is_file():
+            try:
+                data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+                self.apply_project_state(data)
+                self._proj_clean = data.get("clean", "")
+            except Exception as e:
+                self.log(f"A legutóbbi munkamenet nem tölthető vissza: {e}")
+        if not self._proj_clean:
+            self._mark_clean()
+        self._update_project_label()
+
+    # ---------------------------------------------------- tiszta lap (fülenként)
+    def clear_generate(self, ask: bool = False):
+        if ask and QMessageBox.question(self, "Tiszta lap", "Kiürítsem a Generálás fület?\n(A fő modell és a VAE "
+                                        "megmarad; a kész dalok a Könyvtárban maradnak.)") != QMessageBox.Yes:
+            return
+        self.set_form({"lyrics": "", "style": "", "title": "", "cot": "full", "use_abc": False, "instrumental": False,
+                       "random_seed": True, "batch": 1, "batch_mode": "inc", "wt_model": "native", "wt_vae": "native",
+                       "ar_lora": "(nincs)", "nar_lora": "(nincs)", "ar_scale": 1.0, "nar_scale": 1.0,
+                       "main": self.cb_main.currentText(), "vae": self.cb_vae.currentText()})
+        for r in reversed(range(self.tbl_queue.rowCount())):
+            it = self.tbl_queue.item(r, 3)
+            if it and (it.text().startswith("✓") or it.text().startswith("✗")):
+                self.tbl_queue.removeRow(r)
+        self.job_rows = {}
+        for r in range(self.tbl_queue.rowCount()):
+            self.job_rows[int(self.tbl_queue.item(r, 0).text())] = r
+        self.current_track = None
+        self.last_abc = ""
+        self.lbl_last.setText("Még nincs eredmény.")
+        for b in (self.btn_play_last, self.btn_folder_last, self.btn_abc_last, self.btn_again):
+            b.setEnabled(False)
+        self.gen_log.clear()
+
+    def clear_abc(self, ask: bool = False):
+        if ask and self.ed_abc.toPlainText().strip() and QMessageBox.question(
+                self, "Tiszta lap", "Kiürítsem az ABC-kotta fület?") != QMessageBox.Yes:
+            return
+        self.ed_abc.clear()
+        self.ed_ref.clear()
+        self.chk_use_abc.setChecked(False)
+
+    def clear_library(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Könyvtár ürítése")
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel("<b>Mely dalokat?</b>"))
+        n_cur = len(self.db.all(project=self.project_name))
+        n_view = len(self.lib_ids)
+        n_all = len(self.db.all())
+        rb_cur = QRadioButton(f"Az aktuális projekt („{self.project_name}”) dalai – {n_cur} db")
+        rb_view = QRadioButton(f"A listában most látható dalok – {n_view} db")
+        rb_all = QRadioButton(f"Minden dal, minden projektből – {n_all} db")
+        rb_cur.setChecked(True)
+        for rb in (rb_cur, rb_view, rb_all):
+            v.addWidget(rb)
+        v.addSpacing(8)
+        v.addWidget(QLabel("<b>Hogyan?</b>"))
+        rb_list = QRadioButton("Csak a listából (a hangfájlok megmaradnak a lemezen)")
+        rb_files = QRadioButton("A listából ÉS a lemezről is (WAV, MP3, ABC) – végleges, nem vonható vissza!")
+        rb_list.setChecked(True)
+        v.addWidget(rb_list)
+        v.addWidget(rb_files)
+        keep_fav = QCheckBox("A kedvencek (★) maradjanak meg")
+        keep_fav.setChecked(True)
+        v.addWidget(keep_fav)
+        info = QLabel("Tipp: ha csak tisztább listát szeretnél, nem kell törölnöd semmit –\n"
+                      "a Projekt választó alapból csak az aktuális projekt dalait mutatja.")
+        info.setObjectName("dim")
+        v.addWidget(info)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("Ürítés")
+        bb.button(QDialogButtonBox.Cancel).setText("Mégse")
+        for b_ in bb.buttons():
+            b_.setMinimumHeight(36)
+            b_.setMinimumWidth(110)
+        v.setSizeConstraint(QLayout.SetMinimumSize)
+        dlg.setMinimumWidth(640)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        install_tip_filter(dlg)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        if rb_cur.isChecked():
+            rows = self.db.all(project=self.project_name)
+        elif rb_view.isChecked():
+            rows = [t for t in (self.db.get(i) for i in self.lib_ids) if t]
+        else:
+            rows = self.db.all()
+        if keep_fav.isChecked():
+            rows = [t for t in rows if not t.get("fav")]
+        if not rows:
+            QMessageBox.information(self, "Könyvtár ürítése", "Nincs törlendő dal.")
+            return
+        files = rb_files.isChecked()
+        if QMessageBox.question(self, "Könyvtár ürítése", f"{len(rows)} dal törlése a Könyvtárból"
+                                + (" ÉS a lemezről (végleges!)" if files else " (a fájlok megmaradnak)") + ". Mehet?"
+                                ) != QMessageBox.Yes:
+            return
+        if self.player:
+            self.player.stop()
+            self.player.setSource(QUrl())
+        for t in rows:
+            if files:
+                for k in ("wav_path", "abc_path"):
+                    if t.get(k):
+                        Path(t[k]).unlink(missing_ok=True)
+                if t.get("wav_path"):
+                    Path(t["wav_path"]).with_suffix(".mp3").unlink(missing_ok=True)
+            self.db.delete(t["id"])
+        self.ed_search.clear()
+        self._refresh_lib_projects()
+        self.refresh_library()
+        self.log(f"Könyvtár ürítve: {len(rows)} dal" + (" (fájlokkal együtt)" if files else ""))
+
     # ============================================================ bezárás
     def closeEvent(self, ev):
+        # nincs kérdés: a teljes munkamenet elmentődik, és a következő indításkor visszajön
         try:
             self.cfg["last_form"] = self.get_form()
+            self._write_session()
             save_settings(self.cfg)
         except Exception:
             pass
@@ -7881,6 +8478,13 @@ LoRA váltás a modell újratöltésével jár (automatikus).</p>
 <h3>Feladatsor</h3>
 <p>Több generálás is sorba állítható (Darab mező is). A futó feladat csak <b>Azonnali megszakítás</b>-sal
 (szerver újraindítás) állítható le.</p>
+<h3>Projektek és tiszta lap</h3>
+<p>Fent a <b>projekt sáv</b>: egy projekt = minden fül tartalma + a hozzá generált dalok.
+<b>🆕 Új projekt</b> (Ctrl+N) – minden fül kiürül, új név. <b>💾 Mentés</b> (Ctrl+S) – egy .y2proj fájlba.
+<b>📂 Megnyitás</b> (Ctrl+O) / <b>Legutóbbiak</b> – pontosan visszaáll. A ● jel: nem mentett változás.
+Kilépéskor semmi sem vész el: a következő indításkor ott folytatod, ahol abbahagytad.</p>
+<p><b>🧹 Tiszta lap</b> minden munkafülön: csak azt a fület üríti ki. A <b>Könyvtár</b> alapból csak az aktuális
+projekt dalait mutatja; a <b>🧹 Könyvtár ürítése…</b> törli a dalokat (csak a listából, vagy a lemezről is).</p>
 <h3>Átdolgozás – meglévő dal új stílusban</h3>
 <ol>
 <li><b>Tallózás…</b> – MP3/WAV/FLAC… Hosszú dalnál pipáld be a <b>Csak egy részlet</b>-et (60–90 mp ideális).</li>
