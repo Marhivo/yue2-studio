@@ -19,7 +19,7 @@ videókártyádon fut, az [audio.cpp](https://github.com/audio-cpp/audio.cpp) sz
 
 További szolgáltatások:
 - Minden elemen **súgó buborék**.
-- **Többnyelvű felület** (Beállítások → *Felület nyelve*): magyar, English, Deutsch, Français, Romani (lovári). A súgók, a Súgó fül és a Kalauz is lefordult. A fordítások a `lang/` mappában vannak, sima JSON fájlokban, bárki javíthatja őket. A romani fordítás gépi, ezért anyanyelvi átnézést kér. A PDF kézikönyv magyar.
+- **Többnyelvű felület** (Beállítások → *Felület nyelve*): magyar, English, Deutsch, Français, Romani (lovári). A súgók, a Súgó fül és a Kalauz is lefordult. A fordítások a `lang/` mappában vannak, sima JSON fájlokban, bárki javíthatja őket. A romani fordítás gépi, ezért anyanyelvi átnézést kér. A PDF kézikönyv magyarul és angolul is elérhető.
 - A **🧭 Kalauz** lépésenkénti bemutatókkal vezet végig a programon.
 - **Projektek**: az összes fül tartalma egy fájlba menthető és visszatölthető. A Könyvtár csak az aktuális projekt dalait mutatja.
 - **🧹 Tiszta lap** gomb minden munkafülön. Kilépéskor semmi sem vész el.
@@ -72,6 +72,8 @@ A program a következő modelleket tölti le, a `audio-cpp/audio.cpp-gguf` Huggi
 ## Kézikönyv
 
 Részletes, képes, magyar nyelvű kézikönyv: [docs/YuE2_Studio_Kezikonyv.pdf](docs/YuE2_Studio_Kezikonyv.pdf)
+
+English manual: [docs/YuE2_Studio_Manual_EN.pdf](docs/YuE2_Studio_Manual_EN.pdf)
 
 ## Licenc
 

@@ -3983,7 +3983,7 @@ class DawPanel(QWidget):
         for k in order:
             if k not in stems:
                 continue
-            t = self.add_file_as_track(stems[k], name=STEM_NAMES.get(k, k), at=ctx.get("at", 0.0),
+            t = self.add_file_as_track(stems[k], name=tr(STEM_NAMES.get(k, k)), at=ctx.get("at", 0.0),
                                        color=colors.get(k), index=idx + added)
             if t:
                 added += 1
@@ -5811,7 +5811,7 @@ class RemakePanel(QWidget):
     def on_stems(self, stems: dict):
         self.vocals = stems.get("vocals", "")
         self.btn_play_voc.setEnabled(bool(self.vocals))
-        self.lbl_sep.setText("Kész: " + ", ".join(STEM_NAMES.get(k, k) for k in stems))
+        self.lbl_sep.setText("Kész: " + ", ".join(tr(STEM_NAMES.get(k, k)) for k in stems))
         self.step(1, "ok")
         self.say("✓ Ének leválasztva.")
         self._chain_next(1)
@@ -5939,7 +5939,7 @@ class RemakePanel(QWidget):
         tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
         for r_, l in enumerate(self.timed):
             bar = f"{int(l['start'] * bpm / 60 / beats) + 1}." if bpm else "–"
-            for c, val in enumerate((fmt_mmss(l["start"]), bar, f"{l['end'] - l['start']:.1f} mp", l["text"])):
+            for c, val in enumerate((fmt_mmss(l["start"]), bar, f"{l['end'] - l['start']:.1f} s", l["text"])):
                 tbl.setItem(r_, c, QTableWidgetItem(val))
         tbl.resizeColumnsToContents()
         tbl.cellDoubleClicked.connect(lambda r_, c: self._play_at(self.timed[r_]["start"]))
