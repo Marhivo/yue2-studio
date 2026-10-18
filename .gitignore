@@ -1,0 +1,13 @@
+# Felhasználói adatok és munkafájlok (helyben jönnek létre)
+yue2_studio_beallitasok.json
+yue2_studio.db
+presetek/
+daw_projektek/
+kotta_lib/
+kottak/
+atdolgozas/
+kimenet/
+__pycache__/
+*.pyc
+*.wav
+*.mp3
