@@ -88,6 +88,7 @@ felelősségre.
 
 Az app szabadsága nem terjed ki azokra a modellekre, amelyeket a program letölt és használ. Azok mások munkái,
 a saját licencükkel:
+
 - A **YuE2** modellsúlyok és a Mothersuperior LoRA-k licence **CC BY-NC 4.0**, vagyis csak nem kereskedelmi célra
   használhatók.
 - Az audio.cpp licence MIT, a PySide6-é LGPL.
