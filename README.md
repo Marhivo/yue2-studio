@@ -70,7 +70,13 @@ A program a következő modelleket tölti le, a `audio-cpp/audio.cpp-gguf` Huggi
 
 Részletes, képes, magyar nyelvű kézikönyv: [docs/YuE2_Studio_Kezikonyv.pdf](docs/YuE2_Studio_Kezikonyv.pdf)
 
-## Licenc-figyelmeztetés
+## Licenc
+
+Az app kódja és a kézikönyv **szabad**: közkincs ([Unlicense](LICENSE)). Bárki bármire felhasználhatja, másolhatja,
+módosíthatja, eladhatja, engedélykérés és névfeltüntetés nélkül.
+
+### A modellekre más szabályok vonatkoznak
+
 
 - A **YuE2** modellsúlyok és a Mothersuperior LoRA-k licence **CC BY-NC 4.0**, vagyis csak nem kereskedelmi célra
   használhatók.
