@@ -80,6 +80,7 @@ DEFAULT_SETTINGS = {
     "output_dir": str(APP_DIR / "kimenet"),
     "port": 8080,
     "gpu_device": "0",
+    "backend": "vulkan",
     "ffmpeg": "",
     "auto_mp3": False,
     "auto_start_server": True,
@@ -97,10 +98,8 @@ DEFAULT_SETTINGS = {
 # ---------------------------------------------------------------------------
 ENGINE_VERSION = "v0.8.1"
 ENGINE_FILES = [
-    ("https://github.com/0xShug0/audio.cpp/releases/download/v0.8.1/audio-v0.8.1-bin-windows-x64-cuda13.3.zip",
-     "aad5dffe4398b325018cf38e58e6555998ef97948a72ac7582de46e91155ca24"),
-    ("https://github.com/0xShug0/audio.cpp/releases/download/v0.8.1/audio-v0.8.1-cudart-windows-x64-cuda13.3.zip",
-     None),
+    ("https://github.com/0xShug0/audio.cpp/releases/download/v0.8.1/audio-v0.8.1-bin-windows-x64-vulkan.zip",
+     "c787971e025ba8ef900f0482a2cc36a049367081fe89f4841aae521a0b49de32"),
 ]
 
 HF_YUE2 = "https://huggingface.co/audio-cpp/Yue2-3B-GGUF/resolve/main/"
@@ -8077,7 +8076,7 @@ class MainWindow(QMainWindow):
         l = QVBoxLayout(w)
         top = QHBoxLayout()
 
-        g_eng = QGroupBox(f"1. YuE2 motor (audio.cpp {ENGINE_VERSION}, Windows CUDA)")
+        g_eng = QGroupBox(f"1. YuE2 motor (audio.cpp {ENGINE_VERSION}, Windows Vulkan)")
         el = QVBoxLayout(g_eng)
         self.lbl_engine = QLabel("?")
         el.addWidget(self.lbl_engine)
@@ -8292,7 +8291,7 @@ class MainWindow(QMainWindow):
         self.server.setProcessEnvironment(env)
         ed = Path(self.cfg["engine_dir"])
         self.server.setWorkingDirectory(str(ed if (ed / "model_specs").is_dir() else exe.parent))
-        args = ["--ui", "--ui-management", "--backend", "cuda" if IS_WINDOWS else "metal",
+        args = ["--ui", "--ui-management", "--backend", self.cfg.get("backend") or "vulkan",
                 "--host", "127.0.0.1", "--port", str(self.cfg["port"])]
         self.log(f"Szerver indítása: {exe.name} {' '.join(args)}")
         self.worker.reset_sessions()
