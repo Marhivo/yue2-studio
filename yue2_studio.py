@@ -81,6 +81,8 @@ DEFAULT_SETTINGS = {
     "port": 8080,
     "gpu_device": "0",
     "backend": "vulkan",
+    "sheetsage_backend": "cpu",
+    "helper_threads": 10,
     "ffmpeg": "",
     "auto_mp3": False,
     "auto_start_server": True,
@@ -533,6 +535,79 @@ def result_abc(res: dict) -> str:
     return t if isinstance(t, str) and "X:" in t else ""
 
 
+def find_engine_exe(cfg: dict) -> Path | None:
+    d = Path(cfg["engine_dir"])
+    name = "audiocpp_server.exe" if IS_WINDOWS else "audiocpp_server"
+    if (d / name).is_file():
+        return d / name
+    if d.is_dir():
+        for p in d.rglob(name):
+            return p
+    return None
+
+
+class HelperServer:
+    """Ideiglenes második audiocpp_server (port+1) egyetlen feladat idejére, más backenddel.
+    Pl. a SheetSage2 enkódere Vulkanon egy ~4 GB-os puffert kér, amit az AMD driver nem ad meg -> CPU."""
+
+    def __init__(self, cfg: dict, backend: str):
+        self.cfg, self.backend = cfg, backend
+        self.proc: subprocess.Popen | None = None
+        self.log_path: Path | None = None
+        self._logf = None
+
+    def __enter__(self) -> Yue2Api:
+        exe = find_engine_exe(self.cfg)
+        if not exe:
+            raise ApiError("A motor nincs telepítve.")
+        port = int(self.cfg["port"]) + 1
+        api = Yue2Api(port)
+        if api.health():
+            raise ApiError(f"A segédszerver portja ({port}) már foglalt.")
+        ed = Path(self.cfg["engine_dir"])
+        self.log_path = exe.parent / f"segedszerver_{self.backend}.log"
+        self._logf = open(self.log_path, "w", encoding="utf-8", errors="replace")
+        args = [str(exe), "--ui", "--ui-management", "--backend", self.backend,
+                "--threads", str(int(self.cfg.get("helper_threads") or 10)),
+                "--host", "127.0.0.1", "--port", str(port), "--busy-timeout-ms", "0"]
+        try:
+            self.proc = subprocess.Popen(args, cwd=str(ed if (ed / "model_specs").is_dir() else exe.parent),
+                                         stdout=self._logf, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
+            deadline = time.time() + 60
+            while not api.health():
+                if self.proc.poll() is not None:
+                    raise ApiError(f"A segédszerver leállt (kód: {self.proc.returncode}).\n{self.tail()}")
+                if time.time() > deadline:
+                    raise ApiError(f"A segédszerver 60 mp alatt sem indult el.\n{self.tail()}")
+                time.sleep(0.5)
+        except BaseException:
+            self.close()
+            raise
+        return api
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(3)
+        if self._logf:
+            self._logf.close()
+            self._logf = None
+
+    def tail(self, n: int = 15) -> str:
+        try:
+            return "\n".join(self.log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-n:])
+        except Exception:
+            return ""
+
+
 # ---------------------------------------------------------------------------
 # Letöltő szál
 # ---------------------------------------------------------------------------
@@ -974,15 +1049,22 @@ class GenWorker(QThread):
             gguf = Path(cfg["models_dir"]) / SHEET_DIRNAME / "sheetsage2-orig.gguf"
             if not gguf.is_file():
                 raise ApiError("A SheetSage2 modell nincs letöltve.")
-            api.ensure("sheetsage2", str(gguf), "sheetsage2", "midi", {}, cfg.get("unload_other_model", True),
-                       self.log.emit)
-            self.log.emit("Dallam és akkordok felismerése…")
-            res = api.run("sheetsage2", {"audio": fwd(src), "options": {}})
-            abc = result_abc(res) or (res.get("text") or "")
-            if not abc.strip():
-                raise ApiError("A SheetSage2 nem adott vissza ABC-kottát.")
-            if cfg.get("unload_other_model", True):
-                api.unload("sheetsage2")
+            unload = cfg.get("unload_other_model", True)
+            ss_backend = (cfg.get("sheetsage_backend") or "").strip()
+            if ss_backend and ss_backend != (cfg.get("backend") or "vulkan"):
+                if unload:
+                    for mid in api.loaded_ids():
+                        self.log.emit(f"VRAM felszabadítása: {mid} kiürítése")
+                        api.unload(mid)
+                self.log.emit(f"SheetSage2: külön {ss_backend} szerver indítása (ez lassabb)…")
+                helper = HelperServer(cfg, ss_backend)
+                with helper as hapi:
+                    try:
+                        abc = self._sheetsage_run(hapi, gguf, src, False)
+                    except ApiError as e:
+                        raise ApiError(f"{e}\n--- segédszerver napló ---\n{helper.tail()}") from None
+            else:
+                abc = self._sheetsage_run(api, gguf, src, unload)
             if job.get("target") == "remake":
                 self.remake_abc.emit(abc)
             else:
@@ -994,6 +1076,19 @@ class GenWorker(QThread):
                     os.unlink(tmp)
                 except OSError:
                     pass
+
+    def _sheetsage_run(self, api: Yue2Api, gguf: Path, src: Path, unload: bool) -> str:
+        api.ensure("sheetsage2", str(gguf), "sheetsage2", "midi", {}, unload, self.log.emit)
+        self.log.emit("Dallam és akkordok felismerése…")
+        t0 = time.time()
+        res = api.run("sheetsage2", {"audio": fwd(src), "options": {}})
+        abc = result_abc(res) or (res.get("text") or "")
+        if not abc.strip():
+            raise ApiError("A SheetSage2 nem adott vissza ABC-kottát.")
+        self.log.emit(f"Felismerés kész: {time.time() - t0:.0f} mp")
+        if unload:
+            api.unload("sheetsage2")
+        return abc
 
 
 # ---------------------------------------------------------------------------
@@ -8157,14 +8252,7 @@ class MainWindow(QMainWindow):
         return w
 
     def engine_exe(self) -> Path | None:
-        d = Path(self.cfg["engine_dir"])
-        name = "audiocpp_server.exe" if IS_WINDOWS else "audiocpp_server"
-        if (d / name).is_file():
-            return d / name
-        if d.is_dir():
-            for p in d.rglob(name):
-                return p
-        return None
+        return find_engine_exe(self.cfg)
 
     def refresh_install_state(self):
         exe = self.engine_exe()
@@ -8291,7 +8379,7 @@ class MainWindow(QMainWindow):
         self.server.setProcessEnvironment(env)
         ed = Path(self.cfg["engine_dir"])
         self.server.setWorkingDirectory(str(ed if (ed / "model_specs").is_dir() else exe.parent))
-        args = ["--ui", "--ui-management", "--backend", self.cfg.get("backend") or "vulkan",
+        args = ["--ui", "--ui-management", "--backend", self.cfg.get("backend") or "vulkan", "--busy-timeout-ms", "0",
                 "--host", "127.0.0.1", "--port", str(self.cfg["port"])]
         self.log(f"Szerver indítása: {exe.name} {' '.join(args)}")
         self.worker.reset_sessions()
