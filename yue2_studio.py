@@ -316,8 +316,12 @@ def export_audio(ff: str, src, dst, fmt: str, meta: dict | None = None) -> subpr
     return subprocess.run(args + [str(dst)], capture_output=True, creationflags=NO_WINDOW)
 
 
-def safe_name(s: str, maxlen: int = 50) -> str:
+def safe_name(s: str, maxlen: int = 50, middle: bool = False) -> str:
+    """middle=True: túl hosszú névnél középről vág, hogy a vége (stílus, sorszám) megmaradjon."""
     s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", s).strip().replace(" ", "_")
+    if middle and len(s) > maxlen:
+        head = maxlen * 3 // 5
+        s = s[:head].rstrip("._") + "…" + s[-(maxlen - head - 1):].lstrip("._")
     return (s[:maxlen] or "yue2").rstrip("._")
 
 
@@ -863,7 +867,7 @@ class GenWorker(QThread):
         out_dir = Path(cfg["output_dir"]) / dt.date.today().isoformat()
         out_dir.mkdir(parents=True, exist_ok=True)
         stamp = dt.datetime.now().strftime("%H%M%S")
-        base = f"{stamp}_{job['seed']}_{safe_name(job['title'] or job['options'].get('style', ''))}"
+        base = f"{stamp}_{job['seed']}_{safe_name(job['title'] or job['options'].get('style', ''), 100, middle=True)}"
         wav = out_dir / f"{base}.wav"
         wav.write_bytes(audio)
         abc_text = result_abc(res) or job["options"].get("abc", "")
@@ -5927,6 +5931,7 @@ class RemakePanel(QWidget):
         self.set_source(t["wav_path"])
 
     def set_source(self, path):
+        prev_auto = Path(self.src).stem[:50] if self.src else ""
         self.src = path
         self.vocals = ""
         self.ed_file.setText(path)
@@ -5935,7 +5940,7 @@ class RemakePanel(QWidget):
             self.step(i, "todo")
         self.btn_play_voc.setEnabled(False)
         self.lbl_sep.setText("")
-        if not self.ed_title.text():
+        if self.ed_title.text().strip() in ("", prev_auto):  # a saját cím marad, az előző dal neve nem
             self.ed_title.setText(Path(path).stem[:50])
         self._prepare_source()
 
