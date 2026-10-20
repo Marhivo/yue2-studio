@@ -85,6 +85,7 @@ DEFAULT_SETTINGS = {
     "helper_threads": 10,
     "ffmpeg": "",
     "auto_mp3": False,
+    "auto_export": "",
     "auto_start_server": True,
     "unload_other_model": True,
     "ollama_url": "http://127.0.0.1:11434",
@@ -288,6 +289,31 @@ def find_ffmpeg(cfg: dict) -> str | None:
             return f
     local = APP_DIR / "ffmpeg.exe"
     return str(local) if local.is_file() else None
+
+
+# Export-formátumok: név -> (kiterjesztés, ffmpeg kodek-argumentumok)
+EXPORT_FORMATS = {
+    "MP3 320 kbps": (".mp3", ["-c:a", "libmp3lame", "-b:a", "320k"]),
+    "MP3 V0 (VBR)": (".mp3", ["-c:a", "libmp3lame", "-q:a", "0"]),
+    "FLAC": (".flac", ["-c:a", "flac", "-compression_level", "8"]),
+    "OGG Vorbis q8": (".ogg", ["-c:a", "libvorbis", "-q:a", "8"]),
+    "Opus 192 kbps": (".opus", ["-c:a", "libopus", "-b:a", "192k"]),
+}
+EXPORT_EXTS = sorted({ext for ext, _ in EXPORT_FORMATS.values()})
+
+
+def auto_export_format(cfg: dict) -> str:
+    """A régi auto_mp3 kapcsolóból MP3 320 lesz."""
+    fmt = cfg.get("auto_export") or ("MP3 320 kbps" if cfg.get("auto_mp3") else "")
+    return fmt if fmt in EXPORT_FORMATS else ""
+
+
+def export_audio(ff: str, src, dst, fmt: str, meta: dict | None = None) -> subprocess.CompletedProcess:
+    args = [ff, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), *EXPORT_FORMATS[fmt][1]]
+    for k, v in (meta or {}).items():
+        if v:
+            args += ["-metadata", f"{k}={v}"]
+    return subprocess.run(args + [str(dst)], capture_output=True, creationflags=NO_WINDOW)
 
 
 def safe_name(s: str, maxlen: int = 50) -> str:
@@ -855,11 +881,12 @@ class GenWorker(QThread):
                     dur = w.getnframes() / float(w.getframerate())
             except Exception:
                 dur = 0.0
-        if cfg.get("auto_mp3"):
+        fmt = auto_export_format(cfg)
+        if fmt:
             ff = find_ffmpeg(cfg)
             if ff:
-                subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-y", "-i", str(wav), "-b:a", "320k",
-                                str(wav.with_suffix(".mp3"))], creationflags=NO_WINDOW)
+                export_audio(ff, wav, wav.with_suffix(EXPORT_FORMATS[fmt][0]), fmt,
+                             {"title": job["title"] or base, "comment": job["options"].get("style", "")})
         params = {"form": job.get("form", {}), "options": job["options"], "session": job["session"]}
         tid = self.db.add(created=dt.datetime.now().isoformat(timespec="seconds"), title=job["title"] or base,
                           style=job["options"].get("style", ""), lyrics=job["lyrics"], seed=int(job["seed"]),
@@ -1488,7 +1515,8 @@ WIDGET_TIPS = {
     "chk_auto": "Automatikus indítás|Az app indulásakor rögtön elindítja a YuE2 szervert.",
     "chk_unload": "Modell kiürítés váltáskor|A YuE2 és a SheetSage2 nem fér el együtt kényelmesen 16 GB-on - "
                   "bekapcsolva váltáskor az egyiket kiüríti. Ajánlott.",
-    "chk_mp3": "Automatikus MP3|Minden kész WAV mellé 320 kbps MP3-at is készít (ffmpeg kell).",
+    "cb_export": "Automatikus export|Minden kész WAV mellé a választott formátumban is készít egy fájlt "
+                 "(MP3, FLAC, OGG, Opus; ffmpeg kell). Nincs = csak WAV.",
     "chk_tips": "Súgó buborékok|Ezek a magyarázó buborékok. Kikapcsolva nem jelennek meg.",
     "ed_oll_url": "Ollama címe|A helyi Ollama szerver címe (alap: http://127.0.0.1:11434).",
     "cb_oll_model": "Ollama modell|Melyik helyi nyelvi modell írja a dalszöveget / stílus tageket. "
@@ -1557,7 +1585,8 @@ BUTTON_TIPS = {
         "Seed használata": "Seed használata|Csak a seedet veszi át, a véletlen seedet kikapcsolja.",
         "ABC → ABC fül": "ABC megnyitása|A számhoz mentett zenei tervet betölti az ABC-kotta fülre.",
         "📂 Mappa": "Mappa|Megnyitja a Windows Intézőt a fájlra rámutatva.",
-        "MP3 export": "MP3 export|320 kbps MP3 készítése címmel és stílussal a metaadatokban (ffmpeg kell).",
+        "Export": "Export|Mentés MP3 (320 kbps vagy V0), FLAC, OGG Vorbis vagy Opus formátumba, címmel és stílussal "
+                  "a metaadatokban. A formátumot a mentési ablak típus-listájában választod (ffmpeg kell).",
         "🗑 Törlés": "Törlés|Kérdez: csak a listából törli, vagy a fájlokat (WAV, MP3, ABC) is.",
         "🎼 Kotta": "Kotta|A kijelölt dal zenei tervét (dallam + akkordok) kottaként mutatja a Kotta fülön.",
         "🎛 DAW-ba": "DAW-ba|A kijelölt dalt új sávként betölti a DAW sávszerkesztőbe.",
@@ -2044,6 +2073,8 @@ def write_audio(path: str, data, quality=None):
     kw = {}
     if path.lower().endswith(".mp3"):
         kw["quality"] = quality or "320k"
+    elif path.lower().endswith(".ogg"):
+        kw["quality"] = quality or "256 kbps"
     with PBAudioFile(path, "w", DAW_SR, data.shape[0], **kw) as f:
         f.write(np.ascontiguousarray(data, dtype=np.float32))
 
@@ -4263,7 +4294,7 @@ class DawPanel(QWidget):
         out_dir.mkdir(parents=True, exist_ok=True)
         f, _ = QFileDialog.getSaveFileName(self, "Keverés mentése",
                                            str(out_dir / f"{safe_name(self.project.get('name', 'keveres'))}_keveres.wav"),
-                                           "WAV (*.wav);;MP3 (*.mp3);;FLAC (*.flac)")
+                                           "WAV (*.wav);;MP3 (*.mp3);;FLAC (*.flac);;OGG Vorbis (*.ogg)")
         if not f:
             return
         self.engine.pause()
@@ -7754,7 +7785,7 @@ class MainWindow(QMainWindow):
         r = QHBoxLayout()
         acts = [("★ Kedvenc", self._toggle_fav), ("✎ Megjegyzés", self._edit_note), ("Átnevezés", self._rename_track),
                 ("⟲ Beállítások vissza", self._reuse_track), ("Seed használata", self._reuse_seed),
-                ("ABC → ABC fül", self._track_abc), ("📂 Mappa", self._track_folder), ("MP3 export", self._export_mp3),
+                ("ABC → ABC fül", self._track_abc), ("📂 Mappa", self._track_folder), ("Export", self._export_track),
                 ("🎼 Kotta", self._lib_to_score), ("🎛 DAW-ba", self._lib_to_daw), ("✂ Sávokra bontás", self._lib_separate), ("🗑 Törlés", self._delete_track)]
         for txt, fn in acts:
             b = QPushButton(txt)
@@ -8140,25 +8171,32 @@ class MainWindow(QMainWindow):
         if t:
             open_in_explorer(Path(t["wav_path"]))
 
-    def _export_mp3(self):
+    def _export_track(self):
         t = self._sel_track()
         if not t:
             return
         ff = find_ffmpeg(self.cfg)
         if not ff:
-            QMessageBox.warning(self, "MP3", "ffmpeg nem található. Add meg a Beállításokban.")
+            QMessageBox.warning(self, "Export", "ffmpeg nem található. Add meg a Beállításokban.")
             return
         src = Path(t["wav_path"])
-        dst, _ = QFileDialog.getSaveFileName(self, "MP3 mentése", str(src.with_suffix(".mp3")), "MP3 (*.mp3)")
+        filters = {f"{name} (*{ext})": name for name, (ext, _) in EXPORT_FORMATS.items()}
+        last = self.cfg.get("last_export_format")
+        last = last if last in EXPORT_FORMATS else "MP3 320 kbps"
+        sel = next(f for f, n in filters.items() if n == last)
+        dst, flt = QFileDialog.getSaveFileName(self, "Exportálás", str(src.with_suffix(EXPORT_FORMATS[last][0])),
+                                               ";;".join(filters), sel)
         if not dst:
             return
-        p = subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-b:a", "320k",
-                            "-metadata", f"title={t.get('title')}", "-metadata", f"comment={t.get('style')}", dst],
-                           capture_output=True, creationflags=NO_WINDOW)
+        fmt = filters.get(flt, last)
+        dst = Path(dst).with_suffix(EXPORT_FORMATS[fmt][0])
+        self.cfg["last_export_format"] = fmt
+        save_settings(self.cfg)
+        p = export_audio(ff, src, dst, fmt, {"title": t.get("title"), "comment": t.get("style")})
         if p.returncode == 0:
-            self.log(f"MP3 kész: {dst}")
+            self.log(f"Export kész ({fmt}): {dst}")
         else:
-            QMessageBox.warning(self, "MP3", p.stderr.decode("utf-8", "replace")[:500])
+            QMessageBox.warning(self, "Export", p.stderr.decode("utf-8", "replace")[:500])
 
     def _delete_track(self):
         t = self._sel_track()
@@ -8180,7 +8218,8 @@ class MainWindow(QMainWindow):
             for k in ("wav_path", "abc_path"):
                 if t.get(k):
                     Path(t[k]).unlink(missing_ok=True)
-            Path(t["wav_path"]).with_suffix(".mp3").unlink(missing_ok=True)
+            for ext in EXPORT_EXTS:
+                Path(t["wav_path"]).with_suffix(ext).unlink(missing_ok=True)
         self.db.delete(t["id"])
         self.refresh_library()
 
@@ -8517,9 +8556,12 @@ class MainWindow(QMainWindow):
         self.chk_unload = QCheckBox("Másik modell kiürítése váltáskor (YuE2 ↔ SheetSage2) - 16 GB VRAM-hoz ajánlott")
         self.chk_unload.setChecked(bool(self.cfg.get("unload_other_model", True)))
         f.addRow("", self.chk_unload)
-        self.chk_mp3 = QCheckBox("Minden generálás után MP3 is (ffmpeg)")
-        self.chk_mp3.setChecked(bool(self.cfg.get("auto_mp3")))
-        f.addRow("", self.chk_mp3)
+        self.cb_export = QComboBox()
+        self.cb_export.addItem("Nincs (csak WAV)", "")
+        for name in EXPORT_FORMATS:
+            self.cb_export.addItem(name, name)
+        self.cb_export.setCurrentIndex(max(0, self.cb_export.findData(auto_export_format(self.cfg))))
+        f.addRow("Automatikus export:", self.cb_export)
         self.cb_ui_lang = QComboBox()
         for code, name in UI_LANGS:
             self.cb_ui_lang.addItem(name, code)
@@ -8637,7 +8679,8 @@ class MainWindow(QMainWindow):
         self.cfg["gpu_device"] = self.ed_gpu.text().strip()
         self.cfg["auto_start_server"] = self.chk_auto.isChecked()
         self.cfg["unload_other_model"] = self.chk_unload.isChecked()
-        self.cfg["auto_mp3"] = self.chk_mp3.isChecked()
+        self.cfg["auto_export"] = self.cb_export.currentData() or ""
+        self.cfg["auto_mp3"] = False
         self.cfg["show_tooltips"] = self.chk_tips.isChecked()
         self.cfg["ollama_url"] = self.ed_oll_url.text().strip()
         self.cfg["ollama_model"] = self.cb_oll_model.currentText().strip()
@@ -9109,7 +9152,8 @@ class MainWindow(QMainWindow):
                     if t.get(k):
                         Path(t[k]).unlink(missing_ok=True)
                 if t.get("wav_path"):
-                    Path(t["wav_path"]).with_suffix(".mp3").unlink(missing_ok=True)
+                    for ext in EXPORT_EXTS:
+                        Path(t["wav_path"]).with_suffix(ext).unlink(missing_ok=True)
             self.db.delete(t["id"])
         self.ed_search.clear()
         self._refresh_lib_projects()
