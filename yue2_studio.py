@@ -261,6 +261,23 @@ def fwd(p) -> str:
     return str(p).replace("\\", "/")
 
 
+LOG_DIR = APP_DIR / "naplo"
+_log_lock = threading.Lock()
+
+
+def naplo(forras: str, msg: str) -> None:
+    """Napi naplófájl (naplo/ÉÉÉÉ-HH-NN.log) - hogy egy összeomlás / újraindítás után is visszanézhető legyen."""
+    now = dt.datetime.now()
+    try:
+        with _log_lock:
+            LOG_DIR.mkdir(exist_ok=True)
+            with open(LOG_DIR / f"{now:%Y-%m-%d}.log", "a", encoding="utf-8") as f:
+                for line in str(msg).splitlines() or [""]:
+                    f.write(f"{now:%H:%M:%S} [{forras}] {line}\n")
+    except OSError:
+        pass
+
+
 def find_ffmpeg(cfg: dict) -> str | None:
     c = (cfg.get("ffmpeg") or "").strip()
     if c and Path(c).is_file():
@@ -5808,6 +5825,7 @@ class RemakePanel(QWidget):
 
     # ---------------------------------------------------------- segéd
     def say(self, msg):
+        naplo("atdolgozas", msg)
         self.log.appendPlainText(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {msg}")
 
     def step(self, i, state):
@@ -6759,6 +6777,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ log
     def log(self, msg: str):
+        naplo("app", msg)
         ts = dt.datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
         for w in (getattr(self, "gen_log", None), getattr(self, "srv_log", None)):
@@ -8406,6 +8425,7 @@ class MainWindow(QMainWindow):
         data = bytes(self.server.readAllStandardOutput()).decode("utf-8", "replace")
         for line in data.splitlines():
             if line.strip():
+                naplo("szerver", line)
                 self.srv_log.appendPlainText(line)
 
     def _server_finished(self, code, status):
@@ -9236,7 +9256,32 @@ def _translate_after_init(*classes):
         cls.__init__ = init
 
 
+def _install_crash_logging():
+    """Kezeletlen kivételek és natív összeomlások (pl. Qt-ban) Python-veremmel a napi naplóba."""
+    import faulthandler
+
+    def hook(exc_type, exc, tb):
+        naplo("HIBA", "".join(traceback.format_exception(exc_type, exc, tb)))
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = hook
+    threading.excepthook = lambda a: naplo(
+        "HIBA", f"szál: {a.thread.name if a.thread else '?'}\n"
+                + "".join(traceback.format_exception(a.exc_type, a.exc_value, a.exc_traceback)))
+    try:
+        LOG_DIR.mkdir(exist_ok=True)
+        global _FAULT_FILE
+        _FAULT_FILE = open(LOG_DIR / "osszeomlas.log", "a", encoding="utf-8")
+        _FAULT_FILE.write(f"\n=== indítás {dt.datetime.now():%Y-%m-%d %H:%M:%S} ===\n")
+        _FAULT_FILE.flush()
+        faulthandler.enable(_FAULT_FILE, all_threads=True)
+    except OSError:
+        pass
+
+
 def main():
+    _install_crash_logging()
+    naplo("app", f"{APP_NAME} {APP_VERSION} indul")
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
