@@ -33,7 +33,12 @@ A laptop oldala kész és tesztelve van:
    - Mi a gép IPv4-címe (várhatóan 192.168.50.122)?
    - `nvidia-smi`: driver- és VRAM-állapot.
 2. **Indító `.bat` (terv + igen után):** `lan_szerver.bat` az eredeti klón gyökerébe. Feladatai:
-   - Indulás előtt törli a korábbi feltöltések maradékát: `for /d %%D in ("%TEMP%\audiocpp-ui-*") do rd /s /q "%%D"`.
+   - **A `TEMP` és a `TMP` egy ékezet nélküli mappára mutasson**, például `C:\MusicGen\yue2-studio\tmp`
+     (hozd létre, ha nincs meg). Ok: ezen a gépen a felhasználónév ékezetes (`Csákán`). A v0.8.1-es szerver
+     a feltöltött fájl útvonalát a Windows ANSI-kódlapján adja vissza, nem UTF-8-ban, és a laptop ezt nem
+     tudja feldolgozni. (2026-10-20-án élesben előjött.)
+   - Indulás előtt törli a korábbi feltöltések maradékát ebben a mappában:
+     `for /d %%D in ("%TEMP%\audiocpp-ui-*") do rd /s /q "%%D"` (a `set TEMP=...` után).
      A szerver minden indításkor létrehoz egy ilyen mappát, és a feltöltött WAV-ok is ide kerülnek.
    - A helyes munkakönyvtárból (lásd 1. pont) elindítja:
      `audiocpp_server.exe --ui --ui-management --backend cuda --host 0.0.0.0 --port 8080 --busy-timeout-ms 0`

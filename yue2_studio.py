@@ -516,6 +516,10 @@ class Yue2Api:
         try:
             with urllib.request.urlopen(req, timeout=300) as r:
                 return fwd(json.loads(r.read().decode("utf-8"))["path"])
+        except UnicodeDecodeError:
+            raise ApiError("A szerver ideiglenes mappájának útvonala ékezetes (pl. ékezetes Windows-felhasználónév), "
+                           "ezt a v0.8.1-es szerver nem UTF-8-ban adja vissza. A szerver indítása előtt állítsd a TEMP és "
+                           "TMP változót egy ékezet nélküli mappára (lásd docs/HANDOFF-3090-LAN.md).") from None
         except (urllib.error.URLError, KeyError, ValueError) as e:
             raise ApiError(f"A hang feltöltése a szerverre nem sikerült: {e}") from None
 
