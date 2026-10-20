@@ -5980,7 +5980,6 @@ class RemakePanel(QWidget):
         self.set_source(t["wav_path"])
 
     def set_source(self, path):
-        prev_auto = Path(self.src).stem[:50] if self.src else ""
         self.src = path
         self.vocals = ""
         self.ed_file.setText(path)
@@ -5989,8 +5988,7 @@ class RemakePanel(QWidget):
             self.step(i, "todo")
         self.btn_play_voc.setEnabled(False)
         self.lbl_sep.setText("")
-        if self.ed_title.text().strip() in ("", prev_auto):  # a saját cím marad, az előző dal neve nem
-            self.ed_title.setText(Path(path).stem[:50])
+        self.ed_title.setText(Path(path).stem[:50])  # új dal = új cím (utána átírható)
         self._prepare_source()
 
     def _prepare_source(self):
