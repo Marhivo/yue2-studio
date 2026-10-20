@@ -79,6 +79,8 @@ DEFAULT_SETTINGS = {
     "models_dir": str(APP_DIR / "modellek"),
     "output_dir": str(APP_DIR / "kimenet"),
     "port": 8080,
+    "server_host": "127.0.0.1",
+    "server_models_dir": "",
     "gpu_device": "0",
     "backend": "vulkan",
     "sheetsage_backend": "cpu",
@@ -475,10 +477,47 @@ class ApiError(Exception):
     pass
 
 
+def is_remote_host(host: str | None) -> bool:
+    return (host or "").strip().lower() not in ("", "127.0.0.1", "localhost", "::1")
+
+
+def api_for(cfg: dict) -> "Yue2Api":
+    """A beállított (helyi vagy távoli) szerver API-ja; távolinál a modellmappa a szerveroldali útvonalra cserélődik."""
+    host = (cfg.get("server_host") or "127.0.0.1").strip()
+    remote_models = (cfg.get("server_models_dir") or "").strip()
+    return Yue2Api(int(cfg["port"]), host, (cfg["models_dir"], remote_models) if remote_models else None)
+
+
 class Yue2Api:
-    def __init__(self, port: int):
-        self.base = f"http://127.0.0.1:{port}"
+    def __init__(self, port: int, host: str = "127.0.0.1", models_map: tuple[str, str] | None = None):
+        self.base = f"http://{host}:{port}"
+        self.remote = is_remote_host(host)
+        self.models_map = models_map
         self.loaded_sessions: dict[str, dict] = {}
+
+    def server_path(self, path) -> str:
+        """Helyi modell-útvonal -> a szerver szemszögéből (távoli szervernél a server_models_dir alá)."""
+        p = fwd(path)
+        if not self.remote:
+            return p
+        if not self.models_map:
+            raise ApiError("Távoli szerverhez add meg a Beállításokban a szerver modell-mappáját.")
+        local, remote = (fwd(x).rstrip("/") for x in self.models_map)
+        if p.lower() == local.lower() or p.lower().startswith(local.lower() + "/"):
+            return remote + p[len(local):]
+        return p
+
+    def audio_ref(self, path) -> str:
+        """Bemeneti WAV a szerver szemszögéből: távoli szervernél előbb feltöltjük (/v1/ui/upload, --ui kell)."""
+        if not self.remote:
+            return fwd(path)
+        req = urllib.request.Request(self.base + "/v1/ui/upload", data=Path(path).read_bytes(), method="POST",
+                                     headers={"Content-Type": "audio/wav"})
+        try:
+            with urllib.request.urlopen(req, timeout=300) as r:
+                return fwd(json.loads(r.read().decode("utf-8"))["path"])
+        except (urllib.error.URLError, KeyError, ValueError) as e:
+            raise ApiError(f"A hang feltöltése a szerverre nem sikerült: {e}") from None
 
     def _req(self, method: str, path: str, body=None, timeout: float | None = 30.0):
         data = None
@@ -525,7 +564,7 @@ class Yue2Api:
 
     def load(self, mid: str, path: str, family: str, task: str, session_options: dict) -> None:
         self._req("POST", "/v1/models/load", {
-            "id": mid, "path": fwd(path), "family": family, "task": task, "mode": "offline",
+            "id": mid, "path": self.server_path(path), "family": family, "task": task, "mode": "offline",
             "load_options": {}, "session_options": session_options}, timeout=900)
         self.loaded_sessions[mid] = dict(session_options)
 
@@ -840,8 +879,9 @@ class GenWorker(QThread):
 
     def _api(self) -> Yue2Api:
         cfg = self.get_cfg()
-        if not hasattr(self, "_apiobj") or self._apiobj.base.endswith(str(cfg["port"])) is False:
-            self._apiobj = Yue2Api(int(cfg["port"]))
+        api = api_for(cfg)
+        if not hasattr(self, "_apiobj") or (self._apiobj.base, self._apiobj.models_map) != (api.base, api.models_map):
+            self._apiobj = api
         return self._apiobj
 
     def reset_sessions(self):
@@ -921,7 +961,7 @@ class GenWorker(QThread):
         try:
             api.ensure("htdemucs", str(gguf), "htdemucs", "sep", {}, cfg.get("unload_other_model", True), self.log.emit)
             self.log.emit("HTDemucs dolgozik… (ének, dob, basszus, egyéb)")
-            res = api.run("htdemucs", {"audio": fwd(tmp), "options": {}})
+            res = api.run("htdemucs", {"audio": api.audio_ref(tmp), "options": {}})
         finally:
             try:
                 tmp.unlink()
@@ -955,7 +995,7 @@ class GenWorker(QThread):
         try:
             api.ensure("muscriptor", str(gguf), "muscriptor", "midi", {}, cfg.get("unload_other_model", True), self.log.emit)
             self.log.emit("MuScriptor: hangjegyek felismerése…")
-            res = api.run("muscriptor", {"audio": fwd(job["audio"]), "options": {
+            res = api.run("muscriptor", {"audio": api.audio_ref(job["audio"]), "options": {
                 "instruments": job.get("instruments", ""), "output_format": "midi", "prelude_forcing": "false"}})
         finally:
             try:
@@ -1008,7 +1048,7 @@ class GenWorker(QThread):
             except Exception as e:
                 raise ApiError(f"A Qwen3-ASR modell nem töltődött be ({e}). Lehet, hogy a telepített motor ezt még nem "
                                "ismeri - frissítsd a motort a Telepítés fülön.")
-            req = {"audio": fwd(tmp), "text": ""}
+            req = {"audio": api.audio_ref(tmp), "text": ""}
             if job.get("language"):
                 req["language"] = job["language"]
             self.log.emit("Qwen3-ASR dolgozik… (hosszú dalnál pár perc)")
@@ -1050,7 +1090,7 @@ class GenWorker(QThread):
             with PBAudioFile(str(tmp), "w", sr, 1, bit_depth=16) as f:
                 f.write(np.ascontiguousarray(chunk[None, :]))
             try:
-                req = {"audio": fwd(tmp), "text": ""}
+                req = {"audio": api.audio_ref(tmp), "text": ""}
                 if job.get("language"):
                     req["language"] = job["language"]
                 res = api.run("qwen3_asr", req)
@@ -1099,7 +1139,7 @@ class GenWorker(QThread):
                 raise ApiError("A SheetSage2 modell nincs letöltve.")
             unload = cfg.get("unload_other_model", True)
             ss_backend = (cfg.get("sheetsage_backend") or "").strip()
-            if ss_backend and ss_backend != (cfg.get("backend") or "vulkan"):
+            if ss_backend and ss_backend != (cfg.get("backend") or "vulkan") and not api.remote:
                 if unload:
                     for mid in api.loaded_ids():
                         self.log.emit(f"VRAM felszabadítása: {mid} kiürítése")
@@ -1129,7 +1169,7 @@ class GenWorker(QThread):
         api.ensure("sheetsage2", str(gguf), "sheetsage2", "midi", {}, unload, self.log.emit)
         self.log.emit("Dallam és akkordok felismerése…")
         t0 = time.time()
-        res = api.run("sheetsage2", {"audio": fwd(src), "options": {}})
+        res = api.run("sheetsage2", {"audio": api.audio_ref(src), "options": {}})
         abc = result_abc(res) or (res.get("text") or "")
         if not abc.strip():
             raise ApiError("A SheetSage2 nem adott vissza ABC-kottát.")
@@ -1146,9 +1186,10 @@ class StatusPoller(QThread):
     health = Signal(bool)
     gpu = Signal(str)
 
-    def __init__(self, port: int):
+    def __init__(self, port: int, host: str = "127.0.0.1"):
         super().__init__()
         self.port = port
+        self.host = host
         self._stop = False
 
     def stop(self):
@@ -1159,7 +1200,7 @@ class StatusPoller(QThread):
         tick = 0
         while not self._stop:
             if tick % 2 == 0:
-                self.health.emit(Yue2Api(int(self.port)).health())
+                self.health.emit(Yue2Api(int(self.port), self.host).health())
             if smi and tick % 4 == 0:
                 try:
                     out = subprocess.run([smi, "--query-gpu=name,memory.used,memory.total,utilization.gpu",
@@ -1515,6 +1556,10 @@ WIDGET_TIPS = {
     "set_widgets.ffmpeg": "ffmpeg|MP3 exporthoz és nem-WAV referencia hangokhoz kell. Üresen a PATH-on keresi.",
     "sp_port": "Port|A YuE2 szerver helyi portja (alap 8080). A Remiqora is ezt használja - "
                "ne fussanak egyszerre.",
+    "ed_host": "Szerver címe|127.0.0.1 = ezen a gépen fut a szerver (az app indítja). Más cím (pl. 192.168.50.122) = "
+               "távoli szerver: az app nem indít helyit, a bemeneti hangokat feltölti, az eredményt letölti.",
+    "ed_srv_models": "Modellek a szerveren|Távoli szervernél: a modellek mappája A SZERVEREN (pl. C:/yue2-studio/modellek). "
+                     "A modelleknek ezen a gépen is meg kell lenniük, ugyanabban a szerkezetben.",
     "ed_gpu": "CUDA_VISIBLE_DEVICES|Melyik videókártyán fusson (0 = az első). Egy kártyánál maradjon 0.",
     "chk_auto": "Automatikus indítás|Az app indulásakor rögtön elindítja a YuE2 szervert.",
     "chk_unload": "Modell kiürítés váltáskor|A YuE2 és a SheetSage2 nem fér el együtt kényelmesen 16 GB-on - "
@@ -6822,7 +6867,7 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.btn_tour)
         self.statusBar().addPermanentWidget(self.sb_gpu)
 
-        self.poller = StatusPoller(int(self.cfg["port"]))
+        self.poller = StatusPoller(int(self.cfg["port"]), self.cfg.get("server_host") or "127.0.0.1")
         self.poller.health.connect(self._on_health)
         self.poller.gpu.connect(self.sb_gpu.setText)
         self.poller.start()
@@ -8470,6 +8515,10 @@ class MainWindow(QMainWindow):
     def start_server(self):
         if self.server.state() != QProcess.NotRunning:
             return
+        if is_remote_host(self.cfg.get("server_host")):
+            self.server_external = True
+            self.log(f"Távoli szerver: http://{self.cfg['server_host']}:{self.cfg['port']} - helyi szervert nem indítok.")
+            return
         exe = self.engine_exe()
         if not exe:
             QMessageBox.warning(self, APP_NAME, "A motor nincs telepítve.")
@@ -8528,7 +8577,7 @@ class MainWindow(QMainWindow):
         running = self.server.state() != QProcess.NotRunning
         if ok:
             txt = "● fut" + (" (külső)" if self.server_external and not running else "")
-            self.lbl_srv.setText(txt + f"  -  http://127.0.0.1:{self.cfg['port']}")
+            self.lbl_srv.setText(txt + f"  -  http://{self.cfg.get('server_host') or '127.0.0.1'}:{self.cfg['port']}")
             self._restyle(self.lbl_srv, "status_ok")
             self.sb_server.setText("Szerver: ✓ fut")
         elif running:
@@ -8542,7 +8591,7 @@ class MainWindow(QMainWindow):
 
     def _unload_all(self):
         def job():
-            api = Yue2Api(int(self.cfg["port"]))
+            api = api_for(self.cfg)
             for mid in api.loaded_ids():
                 api.unload(mid)
         threading.Thread(target=job, daemon=True).start()
@@ -8595,6 +8644,11 @@ class MainWindow(QMainWindow):
         self.sp_port.setRange(1024, 65535)
         self.sp_port.setValue(int(self.cfg["port"]))
         f.addRow("Port:", self.sp_port)
+        self.ed_host = QLineEdit(self.cfg.get("server_host") or "127.0.0.1")
+        f.addRow("Szerver címe:", self.ed_host)
+        self.ed_srv_models = QLineEdit(self.cfg.get("server_models_dir", ""))
+        self.ed_srv_models.setPlaceholderText("csak távoli szervernél, pl. C:/yue2-studio/modellek")
+        f.addRow("Modellek a szerveren:", self.ed_srv_models)
         self.ed_gpu = QLineEdit(self.cfg.get("gpu_device", "0"))
         f.addRow("CUDA_VISIBLE_DEVICES:", self.ed_gpu)
         self.chk_auto = QCheckBox("Szerver automatikus indítása az app indulásakor")
@@ -8723,6 +8777,10 @@ class MainWindow(QMainWindow):
         old_port = self.cfg.get("port")
         self.cfg["port"] = self.sp_port.value()
         self.poller.port = self.cfg["port"]
+        old_host = self.cfg.get("server_host")
+        self.cfg["server_host"] = self.ed_host.text().strip() or "127.0.0.1"
+        self.cfg["server_models_dir"] = self.ed_srv_models.text().strip()
+        self.poller.host = self.cfg["server_host"]
         self.cfg["gpu_device"] = self.ed_gpu.text().strip()
         self.cfg["auto_start_server"] = self.chk_auto.isChecked()
         self.cfg["unload_other_model"] = self.chk_unload.isChecked()
@@ -8734,7 +8792,7 @@ class MainWindow(QMainWindow):
         save_settings(self.cfg)
         self.refresh_install_state()
         msg = "Beállítások mentve."
-        if old_port != self.cfg["port"]:
+        if old_port != self.cfg["port"] or old_host != self.cfg["server_host"]:
             msg += " A port változás a szerver újraindítása után érvényes."
         self.log(msg)
         QMessageBox.information(self, APP_NAME, msg)
