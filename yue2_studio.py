@@ -8776,14 +8776,21 @@ class MainWindow(QMainWindow):
         self.close()
 
     def _save_settings_ui(self):
+        host = self.ed_host.text().strip() or "127.0.0.1"
+        srv_models = self.ed_srv_models.text().strip()
+        if is_remote_host(host) and not re.match(r"^([A-Za-z]:[\\/]|/|\\\\)", srv_models):
+            QMessageBox.warning(self, APP_NAME, "Távoli szervernél a 'Modellek a szerveren' mezőbe a modellek mappájának "
+                                "TELJES útvonala kell a szerveren, pl. C:/MusicGen/yue2-studio/modellek.\n\n"
+                                f"Most ez van benne: '{srv_models}'. A beállítások nincsenek mentve.")
+            return
         for k, ed in self.set_widgets.items():
             self.cfg[k] = ed.text().strip()
         old_port = self.cfg.get("port")
         self.cfg["port"] = self.sp_port.value()
         self.poller.port = self.cfg["port"]
         old_host = self.cfg.get("server_host")
-        self.cfg["server_host"] = self.ed_host.text().strip() or "127.0.0.1"
-        self.cfg["server_models_dir"] = self.ed_srv_models.text().strip()
+        self.cfg["server_host"] = host
+        self.cfg["server_models_dir"] = srv_models
         self.poller.host = self.cfg["server_host"]
         self.cfg["gpu_device"] = self.ed_gpu.text().strip()
         self.cfg["auto_start_server"] = self.chk_auto.isChecked()
