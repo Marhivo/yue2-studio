@@ -6904,6 +6904,9 @@ class MainWindow(QMainWindow):
         self.proj_timer = QTimer(self)
         self.proj_timer.timeout.connect(self._update_project_label)
         self.proj_timer.start(3000)
+        self.session_timer = QTimer(self)
+        self.session_timer.timeout.connect(self._autosave_session)
+        self.session_timer.start(60_000)
         for seq, fn in (("Ctrl+S", self.save_project), ("Ctrl+Shift+S", lambda: self.save_project(True)),
                         ("Ctrl+O", self.open_project), ("Ctrl+N", self.new_project)):
             sc = QShortcut(QKeySequence(seq), self)
@@ -7575,6 +7578,7 @@ class MainWindow(QMainWindow):
         return self._enqueue_jobs(f, opts, self._build_session(f))
 
     def _enqueue_jobs(self, f: dict, opts: dict, sess: dict) -> list[int]:
+        self._autosave_session()
         jids = []
         base = random.randint(0, 2_147_483_647) if f["random_seed"] else f["seed"]
         for i in range(f["batch"]):
@@ -9164,7 +9168,20 @@ class MainWindow(QMainWindow):
         data = {"app": APP_NAME, "format": 1, "name": self.project_name,
                 "file": str(self.project_file) if self.project_file else "", "clean": self._proj_clean,
                 **self.project_state()}
-        SESSION_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        text = json.dumps(data, ensure_ascii=False)
+        if text == getattr(self, "_session_written", None):
+            return
+        # előbb ideiglenes fájlba, aztán egy lépésben csere: összeomlás / áramszünet nem teheti tönkre a régit
+        tmp = SESSION_FILE.with_suffix(".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, SESSION_FILE)
+        self._session_written = text
+
+    def _autosave_session(self):
+        try:
+            self._write_session()
+        except Exception as e:
+            naplo("HIBA", f"munkamenet automatikus mentése: {e}")
 
     def _restore_session(self):
         self._refresh_lib_projects()
