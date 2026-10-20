@@ -46,7 +46,7 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, QObject, QProcess, QProcessEnvironment, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
-    QLayout, QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QLayout, QAbstractItemView, QApplication, QDialog, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter,
     QTabWidget, QTableWidget, QTableWidgetItem, QTextBrowser, QToolButton, QVBoxLayout, QWidget, QRadioButton,
@@ -92,6 +92,7 @@ DEFAULT_SETTINGS = {
     "unload_other_model": True,
     "ollama_url": "http://127.0.0.1:11434",
     "ollama_model": "",
+    "translate_model": "jobautomation/OpenEuroLLM-Hungarian",
     "show_tooltips": True,
     "ui_lang": "hu",
     "tour_offered": False,
@@ -1301,6 +1302,254 @@ class OllamaWorker(QThread):
             self.done.emit(self.target, txt)
         except Exception as e:
             self.failed.emit(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Énekelhető fordítás (angol -> magyar), szótagszám-ellenőrzéssel
+# ---------------------------------------------------------------------------
+HU_VOWELS = set("aáeéiíoóöőuúüűAÁEÉIÍOÓÖŐUÚÜŰ")
+
+
+def hu_syllables(text: str) -> int:
+    """Magyarban a szótagszám = a magánhangzók száma (pontos)."""
+    return sum(ch in HU_VOWELS for ch in text)
+
+
+def en_syllables(text: str) -> int:
+    """Angol szótagszám becslése (magánhangzó-csoportok, néma e / -ed / -es szabályokkal). Közelítő!"""
+    n = 0
+    for w in re.findall(r"[a-z']+", text.lower()):
+        w = w.replace("'", "")
+        if not w:
+            continue
+        c = len(re.findall(r"[aeiouy]+", w))
+        if c > 1 and w.endswith("e") and not w.endswith(("le", "ee", "ye")):
+            c -= 1
+        elif c > 1 and w.endswith("ed") and not w.endswith(("ted", "ded")):
+            c -= 1
+        elif c > 1 and w.endswith("es") and not w.endswith(("ses", "zes", "ches", "shes", "ges", "ces", "xes")):
+            c -= 1
+        n += max(1, c)
+    return n
+
+
+def _ollama_chat_json(url: str, model: str, prompt: str, timeout: float = 600) -> dict:
+    body = json.dumps({"model": model, "stream": False, "format": "json", "options": {"temperature": 0.6},
+                       "messages": [{"role": "system", "content": "Profi magyar dalszövegíró vagy: angol dalokat "
+                                     "fordítasz énekelhető, természetes magyar szövegre. Csak JSON-t adsz vissza."},
+                                    {"role": "user", "content": prompt}]}).encode("utf-8")
+    req = urllib.request.Request(url.rstrip("/") + "/api/chat", data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        txt = json.loads(r.read().decode("utf-8")).get("message", {}).get("content", "")
+    txt = re.sub(r"<think>.*?</think>", "", txt, flags=re.S).strip()
+    return json.loads(txt)
+
+
+class LyricsTranslator(QThread):
+    """Szakaszonként fordít, a magyar szótagszámot ellenőrzi, az eltérő sorokat soronként újrakéri (max. 3-szor)."""
+    row_done = Signal(int, str)
+    progress = Signal(str)
+    finished_ok = Signal()
+    failed = Signal(str)
+
+    RULES = ("Szabályok: minden magyar sor PONTOSAN a megadott számú szótag legyen (magyarban a szótagszám = a "
+             "magánhangzók száma). A magyar hangsúly mindig az első szótagon van, ezért a sorok elejére és az erős "
+             "ütemekre hangsúlyos, súlyos szótag kerüljön. A jelentést és a képeket kövesd, ne szó szerint fordíts. "
+             "Ha az eredeti sorvégek rímelnek, a magyar is rímeljen. Természetes, énekelhető szórend.")
+
+    def __init__(self, url: str, model: str, song: str, sections: list[list[tuple[int, str, int]]], retries: int = 3):
+        super().__init__()
+        self.url, self.model, self.song, self.sections, self.retries = url, model, song, sections, retries
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def _line(self, en: str, target: int, prev: str, got: str) -> str:
+        prompt = (f"Fordítsd ezt az angol dalsort énekelhető magyarra, PONTOSAN {target} szótagban.\n"
+                  f"Angol sor: {en}\n" + (f"Előző magyar sor (összefüggés): {prev}\n" if prev else "") +
+                  (f"Az előző próbálkozásod: \"{got}\" - ez {hu_syllables(got)} szótag volt, {target} kell.\n" if got else "") +
+                  self.RULES + '\nVálasz JSON: {"line": "..."}')
+        return str(_ollama_chat_json(self.url, self.model, prompt).get("line", "")).strip()
+
+    def run(self):
+        try:
+            for si, sec in enumerate(self.sections):
+                if self._stop:
+                    return
+                self.progress.emit(f"{si + 1}/{len(self.sections)}. szakasz fordítása…")
+                best: dict[int, str] = {}
+                if len(sec) > 1:
+                    listing = "\n".join(f"{k + 1}. ({t} szótag) {en}" for k, (_, en, t) in enumerate(sec))
+                    prompt = (f"A teljes dal (összefüggésnek):\n{self.song}\n\nFordítsd magyarra ennek a szakasznak a "
+                              f"sorait, soronként a zárójelben megadott szótagszámmal:\n{listing}\n\n{self.RULES}\n"
+                              f'Válasz JSON: {{"lines": [...]}} - pontosan {len(sec)} sor, ugyanebben a sorrendben.')
+                    lines = _ollama_chat_json(self.url, self.model, prompt).get("lines") or []
+                    for k, (row, _, _) in enumerate(sec):
+                        if k < len(lines) and isinstance(lines[k], str):
+                            best[row] = lines[k].strip()
+                prev = ""
+                for row, en, target in sec:
+                    if self._stop:
+                        return
+                    cur = best.get(row, "")
+                    tries = 0
+                    while (not cur or hu_syllables(cur) != target) and tries < self.retries:
+                        tries += 1
+                        self.progress.emit(f"{si + 1}/{len(self.sections)}. szakasz: sor újrakérése ({tries}/{self.retries})…")
+                        cand = self._line(en, target, prev, cur)
+                        if cand and (not cur or abs(hu_syllables(cand) - target) < abs(hu_syllables(cur) - target)):
+                            cur = cand
+                    self.row_done.emit(row, cur)
+                    prev = cur
+            self.finished_ok.emit()
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+class SingableTranslateDialog(QDialog):
+    """Táblázat: angol sor | cél szótag | magyar sor | magyar szótag. Átvétel után .result a magyar dalszöveg."""
+    TAG = re.compile(r"^\s*\[[^\]]*\]\s*$")
+
+    def __init__(self, parent, lyrics: str, url: str, model: str):
+        super().__init__(parent)
+        self.setWindowTitle("Énekelhető fordítás - angol → magyar")
+        self.resize(1100, 680)
+        self.url, self.model, self.song = url, model, lyrics
+        self.result = ""
+        self.worker: LyricsTranslator | None = None
+        self.items = [("tag" if self.TAG.match(ln) else "blank" if not ln.strip() else "line", ln.strip())
+                      for ln in lyrics.splitlines()]
+        v = QVBoxLayout(self)
+        info = QLabel(f"Modell: {model}. A cél szótagszám az angol sor BECSÜLT szótagszáma - írd át, ha a dallam mást "
+                      "kíván. A magyar szótagszám pontos (zöld = egyezik). A magyar sorok kézzel is javíthatók.")
+        info.setWordWrap(True)
+        info.setObjectName("dim")
+        v.addWidget(info)
+        shown = [i for i, (k, _) in enumerate(self.items) if k != "blank"]
+        self.tbl = QTableWidget(len(shown), 4)
+        self.tbl.setHorizontalHeaderLabels(["Angol sor", "Cél", "Magyar sor", "Szótag"])
+        hh = self.tbl.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.Stretch)
+        self.tbl.verticalHeader().setVisible(False)
+        self.row_of: dict[int, int] = {}   # items index -> táblázat sor
+        self.spins: dict[int, QSpinBox] = {}
+        for r, i in enumerate(shown):
+            kind, txt = self.items[i]
+            self.row_of[i] = r
+            a = QTableWidgetItem(txt)
+            a.setFlags(a.flags() & ~Qt.ItemIsEditable)
+            self.tbl.setItem(r, 0, a)
+            if kind == "tag":
+                for c in (1, 2, 3):
+                    it = QTableWidgetItem(txt if c == 2 else "")
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                    self.tbl.setItem(r, c, it)
+                continue
+            sp = QSpinBox()
+            sp.setRange(1, 40)
+            sp.setValue(max(1, en_syllables(txt)))
+            sp.valueChanged.connect(lambda _=0, i=i: self._recount(i))
+            self.spins[i] = sp
+            self.tbl.setCellWidget(r, 1, sp)
+            self.tbl.setItem(r, 2, QTableWidgetItem(""))
+            n = QTableWidgetItem("")
+            n.setFlags(n.flags() & ~Qt.ItemIsEditable)
+            self.tbl.setItem(r, 3, n)
+        self.tbl.resizeColumnToContents(1)
+        self.tbl.itemChanged.connect(lambda it: it.column() == 2 and self._recount(self._item_index(it.row())))
+        v.addWidget(self.tbl, 1)
+        self.lbl = QLabel("")
+        v.addWidget(self.lbl)
+        r = QHBoxLayout()
+        self.btn_all = QPushButton("Fordítás")
+        self.btn_all.clicked.connect(lambda: self._start(only_bad=False))
+        self.btn_bad = QPushButton("Csak a piros sorok újra")
+        self.btn_bad.clicked.connect(lambda: self._start(only_bad=True))
+        self.btn_stop = QPushButton("Megszakítás")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(lambda: self.worker and self.worker.stop())
+        ok = QPushButton("Átvétel")
+        ok.clicked.connect(self._accept)
+        cancel = QPushButton("Mégse")
+        cancel.clicked.connect(self.reject)
+        for b in (self.btn_all, self.btn_bad, self.btn_stop):
+            r.addWidget(b)
+        r.addStretch()
+        r.addWidget(ok)
+        r.addWidget(cancel)
+        v.addLayout(r)
+
+    def _item_index(self, row: int) -> int:
+        return next(i for i, r in self.row_of.items() if r == row)
+
+    def _hu(self, i: int) -> str:
+        it = self.tbl.item(self.row_of[i], 2)
+        return it.text().strip() if it else ""
+
+    def _recount(self, i: int):
+        if i not in self.spins:
+            return
+        hu = self._hu(i)
+        cell = self.tbl.item(self.row_of[i], 3)
+        if not cell:
+            return
+        n = hu_syllables(hu)
+        cell.setText(str(n) if hu else "")
+        cell.setForeground(QColor("#4ade80" if hu and n == self.spins[i].value() else "#f87171"))
+
+    def _start(self, only_bad: bool):
+        if self.worker and self.worker.isRunning():
+            return
+        sections, cur = [], []
+        for i, (kind, txt) in enumerate(self.items):
+            if kind == "tag" and cur:
+                sections.append(cur)
+                cur = []
+            elif kind == "line":
+                if not only_bad or hu_syllables(self._hu(i)) != self.spins[i].value() or not self._hu(i):
+                    cur.append((i, txt, self.spins[i].value()))
+        if cur:
+            sections.append(cur)
+        if only_bad:   # a hibás sorok egyenként, saját kérésben
+            sections = [[x] for sec in sections for x in sec]
+        if not sections:
+            self.lbl.setText("Nincs mit fordítani - minden sor szótagszáma egyezik.")
+            return
+        self.worker = LyricsTranslator(self.url, self.model, self.song, sections)
+        self.worker.row_done.connect(lambda i, hu: self.tbl.item(self.row_of[i], 2).setText(hu))
+        self.worker.progress.connect(self.lbl.setText)
+        self.worker.finished_ok.connect(self._done)
+        self.worker.failed.connect(lambda m: (self._done(), self.lbl.setText(f"HIBA: {m}")))
+        for b in (self.btn_all, self.btn_bad):
+            b.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.worker.start()
+
+    def _done(self):
+        for b in (self.btn_all, self.btn_bad):
+            b.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        lines = [i for i in self.spins]
+        good = sum(1 for i in lines if self._hu(i) and hu_syllables(self._hu(i)) == self.spins[i].value())
+        self.lbl.setText(f"Kész: {good}/{len(lines)} sor szótagszáma egyezik.")
+
+    def _accept(self):
+        out = []
+        for i, (kind, txt) in enumerate(self.items):
+            out.append(self._hu(i) or txt if kind == "line" else txt)
+        self.result = "\n".join(out).strip()
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(2000)
+        self.accept()
+
+    def reject(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(2000)
+        super().reject()
 
 
 def ollama_models(url: str) -> list[str]:
@@ -6617,11 +6866,23 @@ class RemakePanel(QWidget):
             return
         what, ok = QInputDialog.getItem(self, "Új szöveg", "Mit csináljon?",
                                         ["Fordítsa angolra, megtartva a szótagszámot",
-                                         "Fordítsa magyarra, megtartva a szótagszámot",
+                                         "Énekelhető fordítás magyarra (szótagszám-ellenőrzéssel)…",
                                          "Írjon új szöveget ugyanerre a szerkezetre (téma megadása)"], 0, False)
         if not ok:
             return
         cur = self.ed_lyrics.toPlainText().strip()
+        if what.startswith("Énekelhető"):
+            if not cur:
+                QMessageBox.information(self, "Fordítás", "Nincs mit fordítani - előbb legyen angol szöveg a 4. lépésben.")
+                return
+            dlg = SingableTranslateDialog(self, cur, m.cfg["ollama_url"], m.cfg.get("translate_model") or m.cfg["ollama_model"])
+            if dlg.exec() == QDialog.Accepted and dlg.result:
+                self.ed_lyrics.setPlainText(dlg.result)
+                i = self.cb_lang_tag.findData("Hungarian")
+                if i >= 0:
+                    self.cb_lang_tag.setCurrentIndex(i)
+                self.say("✓ Magyar fordítás átvéve - nézd át, és ha kell, javítsd.")
+            return
         if what.startswith("Írjon"):
             theme, ok = QInputDialog.getText(self, "Téma", "Miről szóljon az új szöveg?")
             if not ok:
@@ -9119,6 +9380,9 @@ class MainWindow(QMainWindow):
         r.addWidget(self.cb_oll_model, 1)
         r.addWidget(b)
         f2.addRow("Modell:", r)
+        self.ed_tr_model = QLineEdit(self.cfg.get("translate_model", ""))
+        self.ed_tr_model.setPlaceholderText("pl. jobautomation/OpenEuroLLM-Hungarian (üres = a fenti modell)")
+        f2.addRow("Fordító modell:", self.ed_tr_model)
         l.addWidget(g2)
 
         r = QHBoxLayout()
@@ -9222,6 +9486,7 @@ class MainWindow(QMainWindow):
         self.cfg["show_tooltips"] = self.chk_tips.isChecked()
         self.cfg["ollama_url"] = self.ed_oll_url.text().strip()
         self.cfg["ollama_model"] = self.cb_oll_model.currentText().strip()
+        self.cfg["translate_model"] = self.ed_tr_model.text().strip()
         save_settings(self.cfg)
         self.refresh_install_state()
         msg = "Beállítások mentve."
