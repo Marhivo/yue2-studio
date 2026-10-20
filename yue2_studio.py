@@ -318,6 +318,15 @@ def export_audio(ff: str, src, dst, fmt: str, meta: dict | None = None) -> subpr
     return subprocess.run(args + [str(dst)], capture_output=True, creationflags=NO_WINDOW)
 
 
+BATCH_EXTS = (".wav", ".mp3", ".flac", ".ogg", ".m4a")
+
+
+def batch_out_name(title: str, fmt: str) -> str:
+    """A kötegelt átdolgozás kimeneti fájlneve: '<dal> – <stílus> (n).<kit>', csak a tiltott karakterek nélkül."""
+    ext = EXPORT_FORMATS[fmt][0] if fmt in EXPORT_FORMATS else ".wav"
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", title).strip()[:150].rstrip(". ") + ext
+
+
 def safe_name(s: str, maxlen: int = 50, middle: bool = False) -> str:
     """middle=True: túl hosszú névnél középről vág, hogy a vége (stílus, sorszám) megmaradjon."""
     s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", s).strip().replace(" ", "_")
@@ -805,6 +814,7 @@ class GenWorker(QThread):
     asr_done = Signal(str, str)
     asr_timed = Signal(list, str, float)
     remake_abc = Signal(str)
+    batch_ready = Signal(dict)
     idle = Signal()
 
     def __init__(self, get_cfg, db: TrackDB):
@@ -857,6 +867,8 @@ class GenWorker(QThread):
                     self._do_midi(job)
                 elif job["kind"] == "asr":
                     self._do_asr(job)
+                elif job["kind"] == "remake_batch":
+                    self.batch_ready.emit(self._do_remake_batch(job))
                 else:
                     self.job_started.emit(job["id"])
                     info = self._do_generate(job)
@@ -935,6 +947,21 @@ class GenWorker(QThread):
             if ff:
                 export_audio(ff, wav, wav.with_suffix(EXPORT_FORMATS[fmt][0]), fmt,
                              {"title": job["title"] or base, "comment": job["options"].get("style", "")})
+        exp = job.get("export")
+        if exp:
+            dst = Path(exp["dir"]) / batch_out_name(job["title"] or base, exp["fmt"])
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if exp["fmt"] in EXPORT_FORMATS:
+                    ff = find_ffmpeg(cfg)
+                    p = export_audio(ff, wav, dst, exp["fmt"], {"title": job["title"], "comment": job["options"].get("style", "")}) if ff else None
+                    if not p or p.returncode != 0:
+                        raise OSError("ffmpeg nem található" if not p else p.stderr.decode("utf-8", "replace")[:300])
+                else:
+                    shutil.copy2(wav, dst)
+                self.log.emit(f"→ Köteg kimenet: {dst}")
+            except OSError as e:
+                self.log.emit(f"HIBA: a köteg-kimenet mentése nem sikerült ({dst.name}): {e}")
         params = {"form": job.get("form", {}), "options": job["options"], "session": job["session"]}
         tid = self.db.add(created=dt.datetime.now().isoformat(timespec="seconds"), title=job["title"] or base,
                           style=job["options"].get("style", ""), lyrics=job["lyrics"], seed=int(job["seed"]),
@@ -986,6 +1013,8 @@ class GenWorker(QThread):
         if cfg.get("unload_other_model", True):
             api.unload("htdemucs")
         self.log.emit(f"✓ Sávokra bontva: {', '.join(stems)} → {out_dir}")
+        if job.get("_return"):
+            return stems
         self.sep_done.emit(stems, job.get("ctx") or {})
 
     def _do_midi(self, job: dict):
@@ -1068,6 +1097,8 @@ class GenWorker(QThread):
         if cfg.get("unload_other_model", True):
             api.unload("qwen3_asr")
         self.log.emit(f"✓ Szöveg felismerve ({len(text.split())} szó).")
+        if job.get("_return"):
+            return text, job.get("language") or lang
         self.asr_done.emit(text, job.get("language") or lang)
 
     def _do_asr_timed(self, job: dict, api, cfg, mono):
@@ -1157,6 +1188,8 @@ class GenWorker(QThread):
                         raise ApiError(f"{e}\n--- segédszerver napló ---\n{helper.tail()}") from None
             else:
                 abc = self._sheetsage_run(api, gguf, src, unload)
+            if job.get("_return"):
+                return abc
             if job.get("target") == "remake":
                 self.remake_abc.emit(abc)
             else:
@@ -1168,6 +1201,30 @@ class GenWorker(QThread):
                     os.unlink(tmp)
                 except OSError:
                     pass
+
+    def _do_remake_batch(self, job: dict) -> dict:
+        """Kötegelt átdolgozás egy dala: dallam + akkordok (kötelező), igény szerint ének-leválasztás + szövegfelismerés."""
+        src = Path(job["audio"])
+        self.log.emit(f"📁 Köteg {job['index']}/{job['total']}: {src.name}")
+        try:
+            abc = self._do_sheetsage({"audio": str(src), "_return": True})
+        except Exception as e:
+            raise ApiError(f"{src.name}: a dallam kinyerése nem sikerült, a dal kimarad ({e})") from None
+        lyrics, lang = "", ""
+        if job.get("asr_model"):
+            try:
+                stems = self._do_sep({"audio": str(src), "_return": True})
+                try:
+                    lyrics, lang = self._do_asr({"audio": stems["vocals"], "model": job["asr_model"],
+                                                 "language": job.get("language", ""), "_return": True})
+                finally:
+                    for sp in stems.values():
+                        Path(sp).unlink(missing_ok=True)
+            except Exception as e:
+                self.log.emit(f"{src.name}: a szövegfelismerés nem sikerült ({e}) - instrumentális lesz.")
+        with PBAudioFile(str(src)) as f:
+            length = f.frames / f.samplerate
+        return {**job, "abc": abc, "lyrics": lyrics, "lang": lang, "length": length}
 
     def _sheetsage_run(self, api: Yue2Api, gguf: Path, src: Path, unload: bool) -> str:
         api.ensure("sheetsage2", str(gguf), "sheetsage2", "midi", {}, unload, self.log.emit)
@@ -5707,6 +5764,7 @@ class RemakePanel(QWidget):
         self.auto_chain = False
         self.jobs: set[int] = set()
         self.rec: MicRecorder | None = None
+        self.batch: dict | None = None
         REMAKE_DIR.mkdir(exist_ok=True)
         root = QHBoxLayout(self)
         form = QWidget()
@@ -5725,6 +5783,66 @@ class RemakePanel(QWidget):
                                       "dallam, szöveg, stílusok, eredménylista, napló. A kész dalok a Könyvtárban maradnak.")
         r0.addWidget(self.btn_clear, 0, Qt.AlignTop)
         fl.addLayout(r0)
+
+        # köteg
+        cfg = self.main.cfg
+        gb = QGroupBox("📁 Kötegelt átdolgozás (egy mappa összes dala)")
+        gb.setCheckable(True)
+        gb.setChecked(False)
+        inner = QWidget()
+        inner.setVisible(False)
+        gb.toggled.connect(inner.setVisible)
+        lb = QVBoxLayout(gb)
+        lb.addWidget(inner)
+        fb = QFormLayout(inner)
+        fb.setContentsMargins(0, 0, 0, 0)
+
+        def dir_row(ed: QLineEdit, title: str):
+            w_ = QWidget()
+            h = QHBoxLayout(w_)
+            h.setContentsMargins(0, 0, 0, 0)
+            bb = QPushButton("Tallózás…")
+            bb.clicked.connect(lambda: (lambda d: d and ed.setText(d))(QFileDialog.getExistingDirectory(self, title, ed.text())))
+            h.addWidget(ed, 1)
+            h.addWidget(bb)
+            return w_
+        self.ed_bin = QLineEdit(cfg.get("batch_in", ""))
+        self.chk_bsub = QCheckBox("almappákkal együtt")
+        self.chk_bsub.setChecked(bool(cfg.get("batch_sub", False)))
+        rw = dir_row(self.ed_bin, "Forrásmappa (kötegelt átdolgozás)")
+        rw.layout().addWidget(self.chk_bsub)
+        fb.addRow("Forrásmappa:", rw)
+        self.ed_bout = QLineEdit(cfg.get("batch_out", ""))
+        fb.addRow("Célmappa:", dir_row(self.ed_bout, "Célmappa (kötegelt átdolgozás)"))
+        self.cb_bfmt = QComboBox()
+        self.cb_bfmt.addItem("WAV", "WAV")
+        for name in EXPORT_FORMATS:
+            self.cb_bfmt.addItem(name, name)
+        self.cb_bfmt.setCurrentIndex(max(0, self.cb_bfmt.findData(cfg.get("batch_fmt", "FLAC"))))
+        fb.addRow("Formátum:", self.cb_bfmt)
+        self.cb_blyr = QComboBox()
+        self.cb_blyr.addItem("Felismert szöveg (Qwen3-ASR, a 4. lépés Nyelv mezője szerint)", "asr")
+        self.cb_blyr.addItem("Instrumentális", "instr")
+        self.cb_blyr.setCurrentIndex(max(0, self.cb_blyr.findData(cfg.get("batch_lyrics", "asr"))))
+        fb.addRow("Szöveg:", self.cb_blyr)
+        rw = QWidget()
+        h = QHBoxLayout(rw)
+        h.setContentsMargins(0, 0, 0, 0)
+        self.btn_bstart = QPushButton("▶ Köteg indítása")
+        self.btn_bstart.clicked.connect(self.start_batch)
+        self.btn_bstop = QPushButton("■ Leállítás")
+        self.btn_bstop.clicked.connect(self.stop_batch)
+        self.lbl_bstat = QLabel("")
+        self.lbl_bstat.setObjectName("dim")
+        h.addWidget(self.btn_bstart)
+        h.addWidget(self.btn_bstop)
+        h.addWidget(self.lbl_bstat, 1)
+        fb.addRow("", rw)
+        gb.setToolTip(tip_html("Kötegelt átdolgozás|A forrásmappa minden dalát átdolgozza az 5–6. lépés beállításaival "
+                               "(stílusok, énekhang, változatok, COT, azonos hossz). Dalonként: dallam + akkordok, "
+                               "igény szerint szövegfelismerés, majd generálás. A kész számok a Könyvtárba és a célmappába "
+                               "is kerülnek. Ami a célmappában már megvan, azt kihagyja - így megszakadás után folytatható."))
+        fl.addWidget(gb)
 
         # 1. dal
         g1 = QGroupBox("1. A dal")
@@ -5932,6 +6050,14 @@ class RemakePanel(QWidget):
         g5 = QGroupBox("5. Új stílus - több is választható, mindegyikből készül változat")
         l5 = QVBoxLayout(g5)
         grid = QGridLayout()
+        r = QHBoxLayout()
+        for txt, val in (("Mind", True), ("Egyik sem", False)):
+            bsel = QPushButton(txt)
+            bsel.setToolTip(tip_html(f"{txt}|Minden stílus kijelölése / kijelölés törlése."))
+            bsel.clicked.connect(lambda _=False, v=val: [cb.setChecked(v) for cb in self.style_checks.values()])
+            r.addWidget(bsel)
+        r.addStretch()
+        l5.addLayout(r)
         self.style_checks = {}
         for i, (name, tags) in enumerate(REMAKE_STYLES.items()):
             cb = QCheckBox(name)
@@ -6086,6 +6212,124 @@ class RemakePanel(QWidget):
 
     def _is_recording(self) -> bool:
         return bool(self.src) and Path(self.src).name.startswith("felvetel_")
+
+    # ---------------------------------------------------------- kötegelt átdolgozás
+    def _batch_titles(self, stem: str, name: str, n: int) -> list[str]:
+        title = f"{stem} – {name}"
+        return [title] if n == 1 else [f"{title} ({i + 1})" for i in range(n)]
+
+    def _batch_done(self, b: dict, stem: str, name: str) -> bool:
+        return all((Path(b["out"]) / batch_out_name(t, b["fmt"])).is_file() for t in self._batch_titles(stem, name, b["n"]))
+
+    def start_batch(self):
+        if self.batch and self.batch["prepared"] + self.batch["failed"] < self.batch["total"]:
+            QMessageBox.information(self, "Köteg", "Már fut egy köteg. Előbb állítsd le, vagy várd meg az előkészítés végét.")
+            return
+        src, out = self.ed_bin.text().strip(), self.ed_bout.text().strip()
+        if not src or not Path(src).is_dir():
+            QMessageBox.information(self, "Köteg", "Adj meg egy létező forrásmappát.")
+            return
+        if not out:
+            QMessageBox.information(self, "Köteg", "Adj meg egy célmappát.")
+            return
+        sts = self.styles()
+        if not sts:
+            QMessageBox.information(self, "Köteg", "Válassz legalább egy stílust (5. lépés).")
+            return
+        if not self.main.server_ok:
+            QMessageBox.information(self, "Köteg", "A szerver nem fut - indítsd el a Telepítés & Szerver fülön.")
+            return
+        use_asr = self.cb_blyr.currentData() == "asr"
+        if use_asr and self.asr_model() is None:
+            QMessageBox.information(self, "Köteg", "A szövegfelismeréshez töltsd le a Qwen3-ASR csomagot, "
+                                    "vagy válaszd az Instrumentális szöveget.")
+            return
+        outp = Path(out)
+        files = sorted(p for p in Path(src).glob("**/*" if self.chk_bsub.isChecked() else "*")
+                       if p.is_file() and p.suffix.lower() in BATCH_EXTS and outp not in p.parents)
+        if not files:
+            QMessageBox.information(self, "Köteg", "A forrásmappában nincs hangfájl (WAV, MP3, FLAC, OGG, M4A).")
+            return
+        outp.mkdir(parents=True, exist_ok=True)
+        b = {"id": new_id(), "out": out, "fmt": self.cb_bfmt.currentData(), "styles": sts, "n": self.sp_n.value(),
+             "cot": self.cb_cot.currentData(), "same_len": self.chk_same_len.isChecked(),
+             "total": 0, "prepared": 0, "failed": 0, "skipped": 0, "prep_jids": set(), "gen_jids": set()}
+        todo = [p for p in files if not all(self._batch_done(b, p.stem, name) for name, _ in sts)]
+        b["skipped"], b["total"] = len(files) - len(todo), len(todo)
+        self.batch = b
+        for i, p in enumerate(todo):
+            self.main.job_counter += 1
+            jid = self.main.job_counter
+            self.main.worker.add({"id": jid, "kind": "remake_batch", "fail_kind": "remake_batch", "audio": str(p),
+                                  "batch_id": b["id"], "index": i + 1, "total": len(todo),
+                                  "asr_model": str(self.asr_model()) if use_asr else "",
+                                  "language": self.cb_lang.currentData()})
+            b["prep_jids"].add(jid)
+        cfg = self.main.cfg
+        cfg.update({"batch_in": src, "batch_sub": self.chk_bsub.isChecked(), "batch_out": out,
+                    "batch_fmt": b["fmt"], "batch_lyrics": self.cb_blyr.currentData()})
+        save_settings(cfg)
+        self.main._update_queue_label()
+        self.say(f"📁 Köteg indul: {len(todo)} dal × {len(sts)} stílus × {b['n']} változat → {out} ({b['fmt']})"
+                 + (f"; {b['skipped']} dal már kész volt, kihagyom." if b["skipped"] else ""))
+        self._batch_status()
+
+    def on_batch_item(self, item: dict):
+        b = self.batch
+        if not b or item.get("batch_id") != b["id"]:
+            return
+        b["prepared"] += 1
+        stem = Path(item["audio"]).stem
+        instr = not item.get("lyrics")
+        lyrics = "[instrumental]" if instr else auto_structure_lyrics(item["lyrics"])
+        n_jobs = 0
+        for name, style in b["styles"]:
+            if self._batch_done(b, stem, name):
+                continue
+            jids = self.main.enqueue_custom(lyrics=lyrics, style=style, abc=item["abc"], cot=b["cot"], count=b["n"],
+                                            title=f"{stem} – {name}", instrumental=instr,
+                                            length_sec=int(item["length"]) + 5 if b["same_len"] else None,
+                                            export={"dir": b["out"], "fmt": b["fmt"]})
+            b["gen_jids"].update(jids)
+            n_jobs += len(jids)
+        self.say(f"✓ {stem}: dallam kész{'' if instr else ', szöveg felismerve'} - {n_jobs} generálás a sorban.")
+        self._batch_status()
+
+    def on_batch_failed(self, msg: str):
+        if self.batch:
+            self.batch["failed"] += 1
+        self.say(f"✗ {msg}")
+        self._batch_status()
+
+    def stop_batch(self):
+        b = self.batch
+        if not b:
+            return
+        m = self.main
+        for jid in b["prep_jids"] | b["gen_jids"]:
+            m.worker.remove(jid)
+            row = m.job_rows.get(jid)
+            it = m.tbl_queue.item(row, 3) if row is not None else None
+            if it and it.text() == tr("várakozik"):
+                m._set_job_cell(jid, 3, tr("törölve"), "#80828e")
+        self.batch = None
+        m._update_queue_label()
+        self.lbl_bstat.setText("Leállítva.")
+        self.say("■ Köteg leállítva - a most futó feladat még befejeződik.")
+
+    def _batch_status(self):
+        b = self.batch
+        if not b:
+            return
+        done = b["prepared"] + b["failed"]
+        txt = f"Előkészítve: {done}/{b['total']}"
+        if b["failed"]:
+            txt += f" · kimaradt: {b['failed']}"
+        if b["skipped"]:
+            txt += f" · már kész volt: {b['skipped']}"
+        if done >= b["total"]:
+            txt += " · a generálások a feladatsorban futnak"
+        self.lbl_bstat.setText(txt)
 
     # ---------------------------------------------------------- mikrofonos felvétel
     def toggle_record(self):
@@ -6420,6 +6664,9 @@ class RemakePanel(QWidget):
             QApplication.beep()
 
     def on_failed(self, kind, msg):
+        if kind == "remake_batch":
+            self.on_batch_failed(msg)
+            return
         idx = {"remake_sep": 1, "remake_abc": 2, "asr": 3}.get(kind)
         if idx is not None:
             self.step(idx, "err")
@@ -6985,6 +7232,7 @@ class MainWindow(QMainWindow):
         self.worker.asr_done.connect(lambda t, l: self.remake and self.remake.on_asr(t, l))
         self.worker.asr_timed.connect(lambda ls, l, tot: self.remake and self.remake.on_asr_timed(ls, l, tot))
         self.worker.remake_abc.connect(lambda a: self.remake and self.remake.on_abc(a))
+        self.worker.batch_ready.connect(lambda it: self.remake and self.remake.on_batch_item(it))
         self.worker.start()
 
         tabs = QTabWidget()
@@ -7720,7 +7968,8 @@ class MainWindow(QMainWindow):
         save_settings(self.cfg)
 
     def enqueue_custom(self, lyrics: str, style: str, abc: str, cot: str, count: int, title: str,
-                       instrumental: bool = False, length_sec: int | None = None) -> list[int]:
+                       instrumental: bool = False, length_sec: int | None = None,
+                       export: dict | None = None) -> list[int]:
         """Generálás a Generálás fül haladó beállításaival, de megadott szöveggel/stílussal/tervvel (Átdolgozás)."""
         f = self.get_form()
         if not f["main"] or not f["vae"]:
@@ -7728,7 +7977,7 @@ class MainWindow(QMainWindow):
             return []
         f.update({"lyrics": lyrics, "style": style, "cot": cot if abc else ("full" if instrumental else "off"),
                   "instrumental": instrumental, "use_abc": False, "title": title, "batch": max(1, int(count)),
-                  "batch_mode": "rand", "random_seed": True})
+                  "batch_mode": "rand", "random_seed": True, "export": export})
         if length_sec:
             f.update({"length_on": True, "length_sec": int(max(15, min(360, length_sec))), "length_min": True})
         opts = self._build_options(f)
@@ -7753,8 +8002,8 @@ class MainWindow(QMainWindow):
             if title and f["batch"] > 1:
                 title = f"{title} ({i + 1})"
             job = {"id": jid, "kind": "gen", "project": self.project_name, "lyrics": f["lyrics"].strip(), "options": dict(opts),
-                   "session": dict(sess), "seed": seed, "title": title,
-                   "form": {**f, "seed": seed, "random_seed": False, "batch": 1}}
+                   "session": dict(sess), "seed": seed, "title": title, "export": f.get("export"),
+                   "form": {**{k: v for k, v in f.items() if k != "export"}, "seed": seed, "random_seed": False, "batch": 1}}
             row = self.tbl_queue.rowCount()
             self.tbl_queue.insertRow(row)
             vals = [str(jid), title or f["style"][:70], str(seed), tr("várakozik"), ""]
