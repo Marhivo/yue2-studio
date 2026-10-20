@@ -2025,6 +2025,66 @@ except Exception:  # pragma: no cover
     sd = None
     HAS_SOUNDDEVICE = False
 
+
+def input_devices() -> list[tuple[str, int]]:
+    """Bemeneti eszközök (név, index) az alapértelmezett host API-n (a Windows ugyanazt a mikrofont több API-n is listázza)."""
+    if not HAS_SOUNDDEVICE:
+        return []
+    try:
+        default_in = sd.default.device[0]
+        api = sd.query_devices(default_in)["hostapi"] if default_in is not None and default_in >= 0 else None
+        return [(d["name"], i) for i, d in enumerate(sd.query_devices())
+                if d["max_input_channels"] > 0 and (api is None or d["hostapi"] == api)]
+    except Exception:
+        return []
+
+
+class MicRecorder:
+    """Mikrofonos felvétel: a sounddevice callback-szála gyűjti a monóra kevert mintákat, a GUI időzítővel olvas."""
+    MAX_SEC = 360
+
+    def __init__(self, device: int | None = None):
+        info = sd.query_devices(device, "input")
+        self.sr = int(info["default_samplerate"])
+        self.chunks: list = []
+        self.frames = 0
+        self.level = 0.0
+        self.stream = sd.InputStream(device=device, samplerate=self.sr, channels=max(1, min(2, int(info["max_input_channels"]))),
+                                     dtype="float32", callback=self._cb)
+
+    def _cb(self, indata, frames, time_info, status):
+        mono = indata.mean(axis=1) if indata.shape[1] > 1 else indata[:, 0]
+        if self.frames < self.MAX_SEC * self.sr:
+            self.chunks.append(mono.copy())
+            self.frames += len(mono)
+        self.level = max(float(np.abs(mono).max()) if len(mono) else 0.0, self.level * 0.85)
+
+    def start(self):
+        self.stream.start()
+
+    @property
+    def seconds(self) -> float:
+        return self.frames / self.sr
+
+    @property
+    def full(self) -> bool:
+        return self.frames >= self.MAX_SEC * self.sr
+
+    def abort(self):
+        try:
+            self.stream.stop()
+            self.stream.close()
+        except Exception:
+            pass
+
+    def stop_and_save(self, path) -> float:
+        self.abort()
+        data = np.concatenate(self.chunks)[: self.MAX_SEC * self.sr] if self.chunks else np.zeros(0, np.float32)
+        if len(data):
+            with PBAudioFile(str(path), "w", self.sr, 1, bit_depth=16) as f:
+                f.write(np.ascontiguousarray(np.clip(data, -1.0, 1.0)[None, :].astype(np.float32)))
+        return len(data) / self.sr
+
 import copy
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -5646,6 +5706,7 @@ class RemakePanel(QWidget):
         self.timed: list[dict] = []
         self.auto_chain = False
         self.jobs: set[int] = set()
+        self.rec: MicRecorder | None = None
         REMAKE_DIR.mkdir(exist_ok=True)
         root = QHBoxLayout(self)
         form = QWidget()
@@ -5688,6 +5749,34 @@ class RemakePanel(QWidget):
         for w_ in (b, b2, self.btn_listen):
             r.addWidget(w_)
         r.addStretch()
+        l1.addLayout(r)
+        r = QHBoxLayout()
+        self.cb_mic = QComboBox()
+        self.cb_mic.addItem("Alapértelmezett mikrofon", None)
+        for name, idx in input_devices():
+            self.cb_mic.addItem(name, idx)
+        last_mic = self.main.cfg.get("rec_device", "")
+        if last_mic and self.cb_mic.findText(last_mic) >= 0:
+            self.cb_mic.setCurrentIndex(self.cb_mic.findText(last_mic))
+        self.cb_mic.setToolTip(tip_html("Bemenet|Melyik eszközről vegyen fel (mikrofon, hangkártya bemenete)."))
+        self.btn_rec = QPushButton("● Felvétel")
+        self.btn_rec.setToolTip(tip_html("Felvétel|Játssz vagy énekelj be egy dallamot: Stop után ez lesz a dal. "
+                                         "A dallamot és az akkordokat a 3. lépés kottává alakítja, ebből készül az "
+                                         "átdolgozás. Saját felvételnél az ének leválasztása és a szövegfelismerés kimarad."))
+        self.btn_rec.clicked.connect(self.toggle_record)
+        self.rec_meter = QProgressBar()
+        self.rec_meter.setRange(0, 100)
+        self.rec_meter.setTextVisible(False)
+        self.rec_meter.setMaximumWidth(160)
+        self.rec_meter.setMaximumHeight(12)
+        self.lbl_rec = QLabel("")
+        self.rec_timer = QTimer(self)
+        self.rec_timer.timeout.connect(self._rec_tick)
+        r.addWidget(QLabel("Felvétel:"))
+        r.addWidget(self.cb_mic, 1)
+        r.addWidget(self.btn_rec)
+        r.addWidget(self.rec_meter)
+        r.addWidget(self.lbl_rec)
         l1.addLayout(r)
         r = QHBoxLayout()
         self.chk_part = QCheckBox("Csak egy részlet:")
@@ -5990,6 +6079,66 @@ class RemakePanel(QWidget):
         self.lbl_sep.setText("")
         self.ed_title.setText(Path(path).stem[:50])  # új dal = új cím (utána átírható)
         self._prepare_source()
+        if self._is_recording():
+            self.step(1, "skip")
+            self.step(3, "skip")
+            self.lbl_sep.setText("Saját felvétel: nincs mit leválasztani.")
+
+    def _is_recording(self) -> bool:
+        return bool(self.src) and Path(self.src).name.startswith("felvetel_")
+
+    # ---------------------------------------------------------- mikrofonos felvétel
+    def toggle_record(self):
+        if self.rec:
+            self._stop_record()
+            return
+        if not HAS_SOUNDDEVICE:
+            QMessageBox.warning(self, "Felvétel", "A 'sounddevice' csomag hiányzik (pip install sounddevice).")
+            return
+        try:
+            self.rec = MicRecorder(self.cb_mic.currentData())
+            self.rec.start()
+        except Exception as e:
+            self.rec = None
+            QMessageBox.warning(self, "Felvétel", f"Nem sikerült megnyitni a bemenetet: {e}\n\n"
+                                "Nézd meg, van-e mikrofon, és a Windows engedi-e (Gépház → Adatvédelem → Mikrofon).")
+            return
+        self.btn_rec.setText("■ Stop")
+        self.cb_mic.setEnabled(False)
+        self.rec_timer.start(50)
+        self.say(f"● Felvétel indul ({self.cb_mic.currentText()}, {self.rec.sr} Hz)…")
+
+    def _rec_tick(self):
+        if not self.rec:
+            return
+        lvl = self.rec.level
+        self.rec_meter.setValue(int(min(1.0, lvl) * 100))
+        self.rec_meter.setStyleSheet("QProgressBar::chunk { background: %s; }" % ("#f87171" if lvl >= 0.98 else "#4ade80"))
+        self.lbl_rec.setText(fmt_mmss(self.rec.seconds))
+        if self.rec.full:
+            self.say(f"A felvétel elérte a {MicRecorder.MAX_SEC // 60} perces korlátot - leállítom.")
+            self._stop_record()
+
+    def _stop_record(self):
+        rec, self.rec = self.rec, None
+        self.rec_timer.stop()
+        self.btn_rec.setText("● Felvétel")
+        self.cb_mic.setEnabled(True)
+        self.rec_meter.setValue(0)
+        path = REMAKE_DIR / f"felvetel_{dt.datetime.now():%Y%m%d_%H%M%S}.wav"
+        try:
+            secs = rec.stop_and_save(path)
+        except Exception as e:
+            self.say(f"HIBA: a felvétel mentése nem sikerült: {e}")
+            return
+        if secs < 1.0:
+            path.unlink(missing_ok=True)
+            self.say("A felvétel túl rövid volt (1 mp alatt) - nem mentettem.")
+            return
+        self.main.cfg["rec_device"] = self.cb_mic.currentText() if self.cb_mic.currentIndex() > 0 else ""
+        save_settings(self.main.cfg)
+        self.set_source(str(path))
+        self.say(f"✓ Felvétel kész ({fmt_mmss(secs)}): {path.name}. Következő: 3. Dallam + akkordok.")
 
     def _prepare_source(self):
         if not self.src:
@@ -6032,6 +6181,11 @@ class RemakePanel(QWidget):
     # ---------------------------------------------------------- 2. ének
     def run_sep(self):
         if not self._need_src():
+            return
+        if self._is_recording():
+            self.step(1, "skip")
+            self.say("Ének leválasztása kihagyva: saját felvétel.")
+            self._chain_next(1)
             return
         mroot = Path(self.main.cfg["models_dir"])
         if not any((mroot / "HTDemucs-GGUF" / n).is_file() for n in ("htdemucs-q8_0.gguf", "htdemucs-f16.gguf")):
@@ -6097,6 +6251,11 @@ class RemakePanel(QWidget):
 
     def run_asr(self):
         if not self._need_src():
+            return
+        if self._is_recording():
+            self.step(3, "skip")
+            self.say("Szövegfelismerés kihagyva: saját felvétel - írd be a szöveget, vagy jelöld: Instrumentális.")
+            self._chain_next(3)
             return
         if self.asr_model() is None:
             self.step(3, "skip")
@@ -9306,6 +9465,9 @@ class MainWindow(QMainWindow):
     # ============================================================ bezárás
     def closeEvent(self, ev):
         # nincs kérdés: a teljes munkamenet elmentődik, és a következő indításkor visszajön
+        if getattr(self, "remake", None) and self.remake.rec:
+            self.remake.rec.abort()
+            self.remake.rec = None
         try:
             self.cfg["last_form"] = self.get_form()
             self._write_session()
