@@ -1315,6 +1315,45 @@ def hu_syllables(text: str) -> int:
     return sum(ch in HU_VOWELS for ch in text)
 
 
+_HU_DIGRAPHS = ("dzs", "cs", "dz", "gy", "ly", "ny", "sz", "ty", "zs")
+
+
+def hu_syllabify(text: str) -> str:
+    """Magyar szótagolás megjelenítéshez (visszajelzés a modellnek): 'Cso-da ke-gye-lem'. Közelítő, de a szótagSZÁM pontos."""
+    def word(w: str) -> str:
+        units, i = [], 0
+        while i < len(w):   # betűk, a kettős/hármas mássalhangzók egy egységként
+            d = next((g for g in _HU_DIGRAPHS if w[i:i + len(g)].lower() == g), None)
+            units.append(w[i:i + len(d)] if d else w[i])
+            i += len(d) if d else 1
+        vow = [k for k, u in enumerate(units) if u in HU_VOWELS]
+        if len(vow) < 2:
+            return w
+        cuts = []
+        for a, b in zip(vow, vow[1:]):
+            gap = b - a - 1   # mássalhangzók a két magánhangzó között
+            cuts.append(b if gap == 0 else b - 1)
+        out, prev = [], 0
+        for c in cuts:
+            out.append("".join(units[prev:c]))
+            prev = c
+        out.append("".join(units[prev:]))
+        return "-".join(out)
+    return " ".join(word(w) for w in text.split())
+
+
+def clean_lyric_line(s: str) -> str:
+    """A modell által odaírt sorszámok, szótagszám-megjegyzések, idézőjelek levágása."""
+    s = re.sub(r"^\s*\d+[.)]\s*", "", str(s))
+    s = re.sub(r"\s*[\(\[]\s*\d+\s*(szótag|syllables?)?\s*[\)\]]\s*$", "", s, flags=re.I)
+    return s.strip().strip('"„”“').strip()
+
+
+def pick_closest(cands, target: int) -> str:
+    cands = [clean_lyric_line(c) for c in cands if isinstance(c, str) and c.strip()]
+    return min(cands, key=lambda c: abs(hu_syllables(c) - target)) if cands else ""
+
+
 def en_syllables(text: str) -> int:
     """Angol szótagszám becslése (magánhangzó-csoportok, néma e / -ed / -es szabályokkal). Közelítő!"""
     n = 0
@@ -1334,7 +1373,7 @@ def en_syllables(text: str) -> int:
 
 
 def _ollama_chat_json(url: str, model: str, prompt: str, timeout: float = 600) -> dict:
-    body = json.dumps({"model": model, "stream": False, "format": "json", "options": {"temperature": 0.6},
+    body = json.dumps({"model": model, "stream": False, "format": "json", "options": {"temperature": 0.6, "num_ctx": 4096},
                        "messages": [{"role": "system", "content": "Profi magyar dalszövegíró vagy: angol dalokat "
                                      "fordítasz énekelhető, természetes magyar szövegre. Csak JSON-t adsz vissza."},
                                     {"role": "user", "content": prompt}]}).encode("utf-8")
@@ -1366,11 +1405,16 @@ class LyricsTranslator(QThread):
         self._stop = True
 
     def _line(self, en: str, target: int, prev: str, got: str) -> str:
+        fb = ""
+        if got:
+            n = hu_syllables(got)
+            fb = (f"Az eddigi legjobb: \"{got}\" - szótagolva: {hu_syllabify(got)} = {n} szótag. "
+                  f"{target} kell, tehát {'vegyél el ' + str(n - target) if n > target else 'tegyél hozzá ' + str(target - n)} "
+                  "szótagot (rövidebb/hosszabb szóval, névelő elhagyásával vagy hozzáadásával).\n")
         prompt = (f"Fordítsd ezt az angol dalsort énekelhető magyarra, PONTOSAN {target} szótagban.\n"
-                  f"Angol sor: {en}\n" + (f"Előző magyar sor (összefüggés): {prev}\n" if prev else "") +
-                  (f"Az előző próbálkozásod: \"{got}\" - ez {hu_syllables(got)} szótag volt, {target} kell.\n" if got else "") +
-                  self.RULES + '\nVálasz JSON: {"line": "..."}')
-        return str(_ollama_chat_json(self.url, self.model, prompt).get("line", "")).strip()
+                  f"Angol sor: {en}\n" + (f"Előző magyar sor (összefüggés): {prev}\n" if prev else "") + fb +
+                  self.RULES + '\nAdj 5 különböző változatot. Válasz JSON: {"options": ["...", "...", "...", "...", "..."]}')
+        return pick_closest(_ollama_chat_json(self.url, self.model, prompt).get("options") or [], target)
 
     def run(self):
         try:
@@ -1383,11 +1427,17 @@ class LyricsTranslator(QThread):
                     listing = "\n".join(f"{k + 1}. ({t} szótag) {en}" for k, (_, en, t) in enumerate(sec))
                     prompt = (f"A teljes dal (összefüggésnek):\n{self.song}\n\nFordítsd magyarra ennek a szakasznak a "
                               f"sorait, soronként a zárójelben megadott szótagszámmal:\n{listing}\n\n{self.RULES}\n"
-                              f'Válasz JSON: {{"lines": [...]}} - pontosan {len(sec)} sor, ugyanebben a sorrendben.')
-                    lines = _ollama_chat_json(self.url, self.model, prompt).get("lines") or []
-                    for k, (row, _, _) in enumerate(sec):
-                        if k < len(lines) and isinstance(lines[k], str):
-                            best[row] = lines[k].strip()
+                              "Minden sorra adj 5 különböző változatot (a szótagszámot NE írd a sorba). "
+                              f'Válasz JSON: {{"lines": [["v1", "v2", "v3", "v4", "v5"], ...]}} - pontosan {len(sec)} elem, '
+                              "ugyanebben a sorrendben.")
+                    try:
+                        lines = _ollama_chat_json(self.url, self.model, prompt).get("lines") or []
+                    except Exception as e:   # pl. az Ollama 500-zal megszakítja: soronként folytatjuk
+                        self.progress.emit(f"A szakasz-kérés nem sikerült ({e}) - soronként folytatom…")
+                        lines = []
+                    for k, (row, _, t) in enumerate(sec):
+                        if k < len(lines):
+                            best[row] = pick_closest(lines[k] if isinstance(lines[k], list) else [lines[k]], t)
                 prev = ""
                 for row, en, target in sec:
                     if self._stop:
