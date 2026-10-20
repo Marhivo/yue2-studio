@@ -6155,31 +6155,43 @@ class RemakePanel(QWidget):
                 bpm = 0.0
         return bpm, beats
 
+    def _timed_with_edits(self) -> tuple[list[dict], str]:
+        """Az időzítések a szövegmező AKTUÁLIS soraival, sorrendben párosítva (szakaszjelölők, üres sorok nélkül)."""
+        rows = [ln.strip() for ln in self.ed_lyrics.toPlainText().splitlines()
+                if ln.strip() and not re.fullmatch(r"\[[^\]]*\]", ln.strip())]
+        timed = [dict(l, text=rows[i]) if i < len(rows) else dict(l) for i, l in enumerate(self.timed)]
+        if len(rows) == len(self.timed):
+            return timed, ""
+        return timed, (f"Figyelem: a szövegben {len(rows)} sor van, az időzítésben {len(self.timed)}. A sorokat sorrendben "
+                       "párosítom - ha sorokat összevontál vagy szétvágtál, a párosítás elcsúszhat.")
+
     def show_timing(self):
         if not self.timed:
             return
+        timed, warn = self._timed_with_edits()
         bpm, beats = self._bpm_and_meter()
         dlg = QDialog(self)
         dlg.setWindowTitle("Időzítés – melyik sor hol szól az eredetiben")
         dlg.resize(760, 560)
         v = QVBoxLayout(dlg)
         head = f"Tempó: kb. {bpm:.0f} BPM, {beats} negyed / ütem. " if bpm else ""
-        info = QLabel(head + "Dupla kattintás egy sorra: az eredeti dal lejátszása attól a ponttól.")
+        info = QLabel(head + "Dupla kattintás egy sorra: az eredeti dal lejátszása attól a ponttól."
+                      + (f"\n\n{warn}" if warn else ""))
         info.setWordWrap(True)
         info.setObjectName("dim")
         v.addWidget(info)
-        tbl = QTableWidget(len(self.timed), 4)
+        tbl = QTableWidget(len(timed), 4)
         tbl.setHorizontalHeaderLabels(["Kezdet", "Ütem", "Hossz", "Sor"])
         tbl.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         tbl.verticalHeader().setVisible(False)
         tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
         tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
-        for r_, l in enumerate(self.timed):
+        for r_, l in enumerate(timed):
             bar = f"{int(l['start'] * bpm / 60 / beats) + 1}." if bpm else "–"
             for c, val in enumerate((fmt_mmss(l["start"]), bar, f"{l['end'] - l['start']:.1f} s", l["text"])):
                 tbl.setItem(r_, c, QTableWidgetItem(val))
         tbl.resizeColumnsToContents()
-        tbl.cellDoubleClicked.connect(lambda r_, c: self._play_at(self.timed[r_]["start"]))
+        tbl.cellDoubleClicked.connect(lambda r_, c: self._play_at(timed[r_]["start"]))
         v.addWidget(tbl, 1)
         bb = QDialogButtonBox(QDialogButtonBox.Close)
         bb.button(QDialogButtonBox.Close).setText("Bezárás")
