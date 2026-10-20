@@ -1867,6 +1867,47 @@ def install_translation_hooks():
     _QFD.getExistingDirectory = staticmethod(lambda parent=None, caption="", *a, **k: gd(parent, tr(caption), *a, **k))
 
 
+def install_dir_memory(cfg: dict) -> None:
+    """Tallózáskor ablakonként (a cím szerint) megjegyzi az utoljára használt mappát: cfg["last_dirs"].
+    remember=False kulcsszóval kikapcsolható (pl. a Beállítások útvonal-mezőinél)."""
+    if getattr(QFileDialog, "_dir_memory", False):
+        return
+
+    def start_dir(caption, directory):
+        last = cfg.get("last_dirs", {}).get(caption)
+        if not last or not Path(last).is_dir():
+            return directory
+        d = Path(str(directory or ""))
+        if d.suffix and not d.is_dir():  # javasolt fájlnév: az marad, csak a mappa cserélődik
+            return str(Path(last) / d.name)
+        return last
+
+    def remember_dir(caption, picked):
+        if picked:
+            p = Path(picked)
+            cfg.setdefault("last_dirs", {})[caption] = str(p if p.is_dir() else p.parent)
+            save_settings(cfg)
+
+    def wrap(name):
+        f0 = getattr(QFileDialog, name)
+
+        def fn(parent=None, caption="", directory="", *a, remember=True, **k):
+            if not remember:
+                return f0(parent, caption, directory, *a, **k)
+            res = f0(parent, caption, start_dir(caption, directory), *a, **k)
+            picked = res if isinstance(res, str) else res[0]
+            if isinstance(picked, list):
+                picked = picked[0] if picked else ""
+            remember_dir(caption, picked)
+            return res
+        setattr(QFileDialog, name, staticmethod(fn))
+
+    for name in ("getOpenFileName", "getOpenFileNames", "getSaveFileName", "getExistingDirectory"):
+        wrap(name)
+    QFileDialog._dir_memory = True
+
+
+
 class TooltipFilter(QObject):
     """Globális ki/be kapcsoló a súgó buborékokhoz."""
 
@@ -6678,6 +6719,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.cfg = load_settings()
+        install_dir_memory(self.cfg)
         self.db = TrackDB(DB_FILE)
         PRESET_DIR.mkdir(exist_ok=True)
         PROJECT_DIR.mkdir(exist_ok=True)
@@ -8528,9 +8570,9 @@ class MainWindow(QMainWindow):
 
             def pick():
                 if is_file:
-                    p, _ = QFileDialog.getOpenFileName(self, label, ed.text() or str(APP_DIR))
+                    p, _ = QFileDialog.getOpenFileName(self, label, ed.text() or str(APP_DIR), remember=False)
                 else:
-                    p = QFileDialog.getExistingDirectory(self, label, ed.text() or str(APP_DIR))
+                    p = QFileDialog.getExistingDirectory(self, label, ed.text() or str(APP_DIR), remember=False)
                 if p:
                     ed.setText(p)
             b.clicked.connect(pick)
