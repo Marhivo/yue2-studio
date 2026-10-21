@@ -66,3 +66,17 @@ A laptop oldala kész és tesztelve van:
 - A szervernek **nincs hitelesítése**, és a `--ui-management` miatt bármilyen szerveroldali fájlt be tud
   tölteni. Ezért fontos, hogy a tűzfalszabály csak a laptop címére szóljon.
 - A SheetSage2 itt CUDA-n fut. A laptopon Vulkanon nem fér el (audio.cpp#996), ezért ott CPU-n futott.
+
+## Ütemezett takarítás (2026-10-21)
+A laptop kötegelt átdolgozása dalonként kb. 50–75 MB-ot tölt fel (`/v1/ui/upload`). A szerver ezeket nem
+törli, csak a `lan_szerver.bat` induláskor. Egy több száz dalos köteg így a 3090-en százas GB-okat hagyna.
+
+**Teendő (terv + igen után, rendszergazdaként):** ütemezett feladat, amely 30 percenként törli a feltöltött
+WAV-okat, ha 2 óránál régebbiek. **Csak a `*-audio.wav` fájlokat** törölje: a szerver saját fájljai
+(pl. `demo_voices`) ugyanebben a mappában vannak, és a futó szervernek szüksége van rájuk.
+
+```
+schtasks /Create /TN "YuE2 feltoltes-takaritas" /SC MINUTE /MO 30 /RU SYSTEM /F /TR "powershell -NoProfile -Command \"Get-ChildItem 'C:\MusicGen\yue2-studio\tmp\audiocpp-ui-*' -Recurse -File -Filter '*-audio.wav' | Where-Object LastWriteTime -lt (Get-Date).AddHours(-2) | Remove-Item -Force\""
+```
+Ellenőrzés: `schtasks /Query /TN "YuE2 feltoltes-takaritas"`, majd egy kézi futtatás
+(`schtasks /Run /TN ...`) után nézd meg, hogy a régi `*-audio.wav` fájlok eltűntek, a `demo_voices` megmaradt.

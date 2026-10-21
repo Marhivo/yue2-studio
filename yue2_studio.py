@@ -822,6 +822,7 @@ class GenWorker(QThread):
         super().__init__()
         self.get_cfg = get_cfg
         self.db = db
+        self._batch_ack = threading.Event()
         self.jobs: list[dict] = []
         self.cond = threading.Condition()
         self._quit = False
@@ -831,6 +832,17 @@ class GenWorker(QThread):
         with self.cond:
             self.jobs.append(job)
             self.cond.notify()
+
+    def prioritize(self, jids) -> None:
+        """A megadott feladatok előre: közvetlenül a most futó feladat mögé (sorrendjük megmarad)."""
+        jids = set(jids)
+        with self.cond:
+            head = [j for j in self.jobs[:1] if j.get("_running")]
+            rest = self.jobs[len(head):]
+            self.jobs = head + [j for j in rest if j["id"] in jids] + [j for j in rest if j["id"] not in jids]
+
+    def batch_ack(self) -> None:
+        self._batch_ack.set()
 
     def clear_pending(self):
         with self.cond:
@@ -869,7 +881,10 @@ class GenWorker(QThread):
                 elif job["kind"] == "asr":
                     self._do_asr(job)
                 elif job["kind"] == "remake_batch":
+                    self._batch_ack.clear()
                     self.batch_ready.emit(self._do_remake_batch(job))
+                    # a dal generálásai ennek a feladatnak a helyére kerülnek, a következő dal elé
+                    self._batch_ack.wait(60)
                 else:
                     self.job_started.emit(job["id"])
                     info = self._do_generate(job)
@@ -949,6 +964,7 @@ class GenWorker(QThread):
                 export_audio(ff, wav, wav.with_suffix(EXPORT_FORMATS[fmt][0]), fmt,
                              {"title": job["title"] or base, "comment": job["options"].get("style", "")})
         exp = job.get("export")
+        exported = False
         if exp:
             dst = Path(exp["dir"]) / batch_out_name(job["title"] or base, exp["fmt"])
             try:
@@ -961,8 +977,16 @@ class GenWorker(QThread):
                 else:
                     shutil.copy2(wav, dst)
                 self.log.emit(f"→ Köteg kimenet: {dst}")
-            except OSError as e:
-                self.log.emit(f"HIBA: a köteg-kimenet mentése nem sikerült ({dst.name}): {e}")
+                exported = True
+            except Exception as e:
+                self.log.emit(f"HIBA: a köteg-kimenet mentése nem sikerült ({dst.name}): {e} - a WAV megmarad: {wav}")
+        if exported and exp.get("cleanup"):
+            # köteg: a célmappába került a kimenet - a köztes fájlok törlése, nem kerül a Könyvtárba
+            for f_ in [wav, Path(abc_path) if abc_path else None, *(wav.with_suffix(x) for x in EXPORT_EXTS)]:
+                if f_ is not None:
+                    Path(f_).unlink(missing_ok=True)
+            self.log.emit(f"✓ Kész: {dst.name}  ({dur:.0f} mp hang, {secs:.0f} mp alatt; köztes fájlok törölve)")
+            return {"track_id": None, "wav": str(dst), "abc": abc_text, "secs": secs, "dur": dur}
         params = {"form": job.get("form", {}), "options": job["options"], "session": job["session"]}
         tid = self.db.add(created=dt.datetime.now().isoformat(timespec="seconds"), title=job["title"] or base,
                           style=job["options"].get("style", ""), lyrics=job["lyrics"], seed=int(job["seed"]),
@@ -984,21 +1008,27 @@ class GenWorker(QThread):
             raise ApiError("A HTDemucs modell nincs letöltve. Telepítés & Szerver fül → pipáld be a "
                            "'HTDemucs - sávokra bontás' csomagot → Kijelöltek letöltése.")
         src = Path(job["audio"])
-        self.log.emit(f"Sávokra bontás: {src.name} - átalakítás 44,1 kHz WAV-ba…")
-        data = read_audio(str(src))
-        tmp = DAW_DIR / "temp" / f"sep_{new_id()}.wav"
-        tmp.parent.mkdir(parents=True, exist_ok=True)
-        with PBAudioFile(str(tmp), "w", DAW_SR, 2, bit_depth=16) as f:
-            f.write(np.ascontiguousarray(data))
+        tmp = None
+        if job.get("server_audio"):   # már feltöltött 44,1 kHz-es sztereó WAV (köteg)
+            ref = job["server_audio"]
+        else:
+            self.log.emit(f"Sávokra bontás: {src.name} - átalakítás 44,1 kHz WAV-ba…")
+            data = read_audio(str(src))
+            tmp = DAW_DIR / "temp" / f"sep_{new_id()}.wav"
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            with PBAudioFile(str(tmp), "w", DAW_SR, 2, bit_depth=16) as f:
+                f.write(np.ascontiguousarray(data))
+            ref = None
         try:
             api.ensure("htdemucs", str(gguf), "htdemucs", "sep", {}, cfg.get("unload_other_model", True), self.log.emit)
             self.log.emit("HTDemucs dolgozik… (ének, dob, basszus, egyéb)")
-            res = api.run("htdemucs", {"audio": api.audio_ref(tmp), "options": {}})
+            res = api.run("htdemucs", {"audio": ref or api.audio_ref(tmp), "options": {}})
         finally:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+            if tmp:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
         outs = res.get("named_audio_outputs") or []
         if not outs:
             raise ApiError("A HTDemucs nem adott vissza sávokat. Kulcsok: " + ", ".join(res.keys()))
@@ -1156,7 +1186,7 @@ class GenWorker(QThread):
             raise ApiError("A YuE2 szerver nem fut.")
         src = Path(job["audio"])
         tmp = None
-        if src.suffix.lower() != ".wav":
+        if src.suffix.lower() != ".wav" and not job.get("server_audio"):
             ff = find_ffmpeg(cfg)
             if not ff:
                 raise ApiError("Nem-WAV fájlhoz ffmpeg kell (Beállítások). Vagy adj meg WAV-ot.")
@@ -1184,11 +1214,11 @@ class GenWorker(QThread):
                 helper = HelperServer(cfg, ss_backend)
                 with helper as hapi:
                     try:
-                        abc = self._sheetsage_run(hapi, gguf, src, False)
+                        abc = self._sheetsage_run(hapi, gguf, src, False)   # helyi segédszerver: helyi út
                     except ApiError as e:
                         raise ApiError(f"{e}\n--- segédszerver napló ---\n{helper.tail()}") from None
             else:
-                abc = self._sheetsage_run(api, gguf, src, unload)
+                abc = self._sheetsage_run(api, gguf, src, unload, job.get("server_audio"))
             if job.get("_return"):
                 return abc
             if job.get("target") == "remake":
@@ -1207,14 +1237,25 @@ class GenWorker(QThread):
         """Kötegelt átdolgozás egy dala: dallam + akkordok (kötelező), igény szerint ének-leválasztás + szövegfelismerés."""
         src = Path(job["audio"])
         self.log.emit(f"📁 Köteg {job['index']}/{job['total']}: {src.name}")
+        api = self._api()
+        tmp = DAW_DIR / "temp" / f"koteg_{new_id()}.wav"
+        ref = None
         try:
-            abc = self._do_sheetsage({"audio": str(src), "_return": True})
+            if api.remote:   # egyszer alakítjuk át és töltjük fel; a dallam és a sávbontás is ezt kapja
+                tmp.parent.mkdir(parents=True, exist_ok=True)
+                with PBAudioFile(str(tmp), "w", DAW_SR, 2, bit_depth=16) as f:
+                    f.write(np.ascontiguousarray(read_audio(str(src))))
+                ref = api.audio_ref(tmp)
+        finally:
+            tmp.unlink(missing_ok=True)
+        try:
+            abc = self._do_sheetsage({"audio": str(src), "_return": True, "server_audio": ref})
         except Exception as e:
             raise ApiError(f"{src.name}: a dallam kinyerése nem sikerült, a dal kimarad ({e})") from None
         lyrics, lang = "", ""
         if job.get("asr_model"):
             try:
-                stems = self._do_sep({"audio": str(src), "_return": True})
+                stems = self._do_sep({"audio": str(src), "_return": True, "server_audio": ref})
                 try:
                     lyrics, lang = self._do_asr({"audio": stems["vocals"], "model": job["asr_model"],
                                                  "language": job.get("language", ""), "_return": True})
@@ -1227,11 +1268,11 @@ class GenWorker(QThread):
             length = f.frames / f.samplerate
         return {**job, "abc": abc, "lyrics": lyrics, "lang": lang, "length": length}
 
-    def _sheetsage_run(self, api: Yue2Api, gguf: Path, src: Path, unload: bool) -> str:
+    def _sheetsage_run(self, api: Yue2Api, gguf: Path, src: Path, unload: bool, ref: str | None = None) -> str:
         api.ensure("sheetsage2", str(gguf), "sheetsage2", "midi", {}, unload, self.log.emit)
         self.log.emit("Dallam és akkordok felismerése…")
         t0 = time.time()
-        res = api.run("sheetsage2", {"audio": api.audio_ref(src), "options": {}})
+        res = api.run("sheetsage2", {"audio": ref or api.audio_ref(src), "options": {}})
         abc = result_abc(res) or (res.get("text") or "")
         if not abc.strip():
             raise ApiError("A SheetSage2 nem adott vissza ABC-kottát.")
@@ -6574,6 +6615,12 @@ class RemakePanel(QWidget):
         self._batch_status()
 
     def on_batch_item(self, item: dict):
+        try:
+            self._on_batch_item(item)
+        finally:
+            self.main.worker.batch_ack()   # a háttérszál csak ezután lép a következő dalra
+
+    def _on_batch_item(self, item: dict):
         b = self.batch
         if not b or item.get("batch_id") != b["id"]:
             return
@@ -6581,16 +6628,18 @@ class RemakePanel(QWidget):
         stem = Path(item["audio"]).stem
         instr = not item.get("lyrics")
         lyrics = "[instrumental]" if instr else auto_structure_lyrics(item["lyrics"])
-        n_jobs = 0
+        n_jobs, new = 0, []
         for name, style in b["styles"]:
             if self._batch_done(b, stem, name):
                 continue
             jids = self.main.enqueue_custom(lyrics=lyrics, style=style, abc=item["abc"], cot=b["cot"], count=b["n"],
                                             title=f"{stem} – {name}", instrumental=instr,
                                             length_sec=int(item["length"]) + 5 if b["same_len"] else None,
-                                            export={"dir": b["out"], "fmt": b["fmt"]})
+                                            export={"dir": b["out"], "fmt": b["fmt"], "cleanup": True})
             b["gen_jids"].update(jids)
+            new += jids
             n_jobs += len(jids)
+        self.main.worker.prioritize(new)
         self.say(f"✓ {stem}: dallam kész{'' if instr else ', szöveg felismerve'} - {n_jobs} generálás a sorban.")
         self._batch_status()
 
@@ -8354,6 +8403,10 @@ class MainWindow(QMainWindow):
 
     def _job_finished(self, jid: int, info: dict):
         self.job_t0.pop(jid, None)
+        if info.get("track_id") is None:   # köteg-kimenet: csak a célmappában van
+            self._set_job_cell(jid, 3, tr("✓ kész"), "#4ade80")
+            self._update_queue_label()
+            return
         self.job_track[jid] = info["track_id"]
         self._set_job_cell(jid, 3, tr("✓ kész"), "#4ade80")
         self.current_track = self.db.get(info["track_id"])
